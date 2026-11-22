@@ -33,6 +33,7 @@ use std::sync::{
 };
 
 mod carry;
+mod revised;
 pub use carry::Carried;
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -76,7 +77,7 @@ pub enum Ticking {
 
 #[derive(Default)]
 pub struct BlockEntities {
-    map: HashMap<Pos, BlockEntity>,
+    map: revised::Revised,
     generations: FxHashMap<Pos, u64>,
     on_load: std::collections::VecDeque<(Pos, u64)>,
     on_load_enabled: bool,
@@ -774,6 +775,11 @@ impl BlockEntities {
     pub fn get(&self, pos: &Pos) -> Option<&BlockEntity> {
         self.map.get(pos)
     }
+    /// What a save of the block entity at `pos` may key its output on: a new
+    /// value after every change, or chance of one (each `&mut` it lends).
+    pub fn revision(&self, pos: &Pos) -> Option<u64> {
+        self.map.revision(pos)
+    }
     pub fn get_mut(&mut self, pos: &Pos) -> Option<&mut BlockEntity> {
         self.asleep.remove(pos);
         self.map.get_mut(pos)
@@ -870,7 +876,7 @@ impl BlockEntities {
         }
         self.asleep.remove(&pos);
         index_chunk(&mut self.by_chunk, pos);
-        let entity = self.map.entry(pos).or_insert_with(make);
+        let entity = self.map.get_or_insert_with(pos, make);
         if absent && matches!(entity, BlockEntity::Mod(_)) {
             if self.on_load_enabled {
                 self.on_load.push_back((pos, self.generations[&pos]));
@@ -1005,7 +1011,8 @@ impl BlockEntities {
     pub fn unload(&mut self, mut gone: impl FnMut(&Pos) -> bool) {
         self.carried.retain(|p, _| !gone(p));
         let asleep = std::mem::take(&mut self.asleep);
-        self.retain(|p, _| !gone(p));
+        let dropped = self.map.retain_keys(|p| !gone(p));
+        self.forget_dropped(&dropped);
         self.retire_taken(gone);
         self.asleep = asleep;
         let map = &self.map;
@@ -1013,34 +1020,29 @@ impl BlockEntities {
     }
     /// Removes the block entities `keep` refuses, and their slots
     /// (`clearAllBlockEntities` of unloaded chunks).
-    pub fn retain(&mut self, mut keep: impl FnMut(&Pos, &mut BlockEntity) -> bool) {
-        let (live, pending, freed, attachments) = (
-            &mut self.live,
-            &mut self.pending,
-            &mut self.freed,
-            &mut self.attachments,
-        );
-        let (mods, boxes, listed) = (&mut self.mods, &mut self.boxes, &mut self.listed);
-        let by_chunk = &mut self.by_chunk;
-        let generations = &mut self.generations;
-        let observer = self.attachment_observer.as_ref();
-        let sign_editors = &mut self.sign_editors;
+    pub fn retain(&mut self, keep: impl FnMut(&Pos, &mut BlockEntity) -> bool) {
         self.asleep.clear();
-        self.map.retain(|p, e| {
-            let kept = keep(p, e);
-            if !kept {
-                retire_attachments(attachments, observer, generations, p);
-                generations.remove(p);
-                *freed |= live.remove(p).is_some();
-                pending.remove(p);
-                forget_mod(mods, *p);
-                boxes.remove(p);
-                forget_listed(listed, p);
-                unindex_chunk(by_chunk, p);
-                sign_editors.remove(p);
-            }
-            kept
-        });
+        let dropped = self.map.retain(keep);
+        self.forget_dropped(&dropped);
+    }
+    /// What [`Self::retain`] forgets of the block entities it dropped from the map.
+    fn forget_dropped(&mut self, dropped: &[Pos]) {
+        for p in dropped {
+            retire_attachments(
+                &mut self.attachments,
+                self.attachment_observer.as_ref(),
+                &self.generations,
+                p,
+            );
+            self.generations.remove(p);
+            self.freed |= self.live.remove(p).is_some();
+            self.pending.remove(p);
+            forget_mod(&mut self.mods, *p);
+            self.boxes.remove(p);
+            forget_listed(&mut self.listed, p);
+            unindex_chunk(&mut self.by_chunk, p);
+            self.sign_editors.remove(p);
+        }
     }
     /// [`Self::unload`] of the block entities in `chunks`, reading theirs alone ([`Self::by_chunk`])
     /// rather than every block entity of the world. The same block entities go, with the same of
@@ -1218,6 +1220,9 @@ mod attachment_tests;
 
 #[cfg(test)]
 mod lease_tests;
+
+#[cfg(test)]
+mod revision_tests;
 
 #[cfg(test)]
 mod tests {
