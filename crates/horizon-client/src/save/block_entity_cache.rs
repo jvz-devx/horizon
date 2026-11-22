@@ -151,6 +151,46 @@ fn write(tag: Tag) -> (Option<Arc<[u8]>>, Tag) {
     (bytes.map(Arc::from), root.tag)
 }
 
+fn has_negative_zero(tag: &Tag) -> bool {
+    let mut stack = vec![tag];
+    while let Some(tag) = stack.pop() {
+        match tag {
+            Tag::Float(bits) if *bits == (-0.0f32).to_bits() => return true,
+            Tag::Double(bits) if *bits == (-0.0f64).to_bits() => return true,
+            Tag::List(items) => stack.extend(items.iter()),
+            Tag::Compound(map) => stack.extend(map.values()),
+            _ => {}
+        }
+    }
+    false
+}
+
+fn tag_bytes(tag: &Tag) -> usize {
+    let mut total = std::mem::size_of::<Tag>();
+    let mut stack = vec![tag];
+    while let Some(tag) = stack.pop() {
+        match tag {
+            Tag::ByteArray(v) => total += v.len(),
+            Tag::String(s) => total += s.0.len() * std::mem::size_of::<u16>(),
+            Tag::IntArray(v) => total += v.len() * std::mem::size_of::<i32>(),
+            Tag::LongArray(v) => total += v.len() * std::mem::size_of::<i64>(),
+            Tag::List(items) => {
+                total += items.len() * std::mem::size_of::<Tag>();
+                stack.extend(items.iter());
+            }
+            Tag::Compound(map) => {
+                for (k, v) in map {
+                    total += std::mem::size_of::<(horizon_core::nbt::JavaString, Tag)>()
+                        + k.0.len() * std::mem::size_of::<u16>();
+                    stack.push(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
 fn read(bytes: &[u8]) -> Option<Tag> {
     nbt::read_named(bytes, Limits::saved())
         .ok()
@@ -225,6 +265,9 @@ impl BlockEntityCache {
                 return saved;
             }
         }
+        if has_negative_zero(&saved) || inputs.source.is_some_and(has_negative_zero) {
+            return saved;
+        }
         let source = match inputs.source {
             None => Some(Source::None),
             Some(source) if *source == saved => Some(Source::Saved),
@@ -241,7 +284,7 @@ impl BlockEntityCache {
                 Source::Other(source) => source.len(),
                 _ => 0,
             }
-            + inputs.name.map_or(0, |_| 256);
+            + inputs.name.map_or(0, tag_bytes);
         let mut shard = self.shard(pos);
         shard.remove(&pos);
         let oversize = size > ENTRY_BYTES;
@@ -286,5 +329,47 @@ impl BlockEntityCache {
     #[cfg(test)]
     pub(super) fn bytes(&self) -> usize {
         self.shards.iter().map(|s| s.lock().unwrap().bytes).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negative_zero_is_not_admitted_to_the_cache() {
+        let cache = BlockEntityCache::new(DEFAULT_BYTES);
+        let pos = (1, 64, 2);
+        let inputs = Inputs {
+            block: "minecraft:furnace",
+            name: None,
+            source: None,
+        };
+        let saved = Tag::compound([("speed", Tag::Float((-0.0f32).to_bits()))]);
+
+        let first = cache.put(pos, 7, &inputs, saved.clone());
+        let second = cache.put(pos, 7, &inputs, saved.clone());
+        assert_eq!(first, saved);
+        assert_eq!(second, saved);
+        assert_eq!(cache.len(), 0);
+        assert!(cache.get(pos, 7, &inputs).is_none());
+    }
+
+    #[test]
+    fn oversize_custom_name_is_charged_and_rejected() {
+        let cache = BlockEntityCache::new(DEFAULT_BYTES);
+        let pos = (3, 64, 4);
+        let long_name = Tag::String("a".repeat(40_000).as_str().into());
+        let inputs = Inputs {
+            block: "minecraft:chest",
+            name: Some(&long_name),
+            source: None,
+        };
+        let saved = Tag::compound([("id", Tag::String("minecraft:chest".into()))]);
+
+        cache.put(pos, 1, &inputs, saved.clone());
+        cache.put(pos, 1, &inputs, saved);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.bytes(), 0);
     }
 }
