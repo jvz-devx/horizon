@@ -500,7 +500,7 @@ impl RegionFile {
     /// Vanilla gets this order by opening the file `DSYNC`: every chunk
     /// write and header write is on the disk before the next starts. Here a
     /// batch of writes costs two syncs (one when it only clears) and one
-    /// header write, not two of each a chunk.
+    /// header write.
     pub fn sync(&mut self) -> io::Result<()> {
         if !self.header_staged {
             return self.file.sync_data();
@@ -509,17 +509,37 @@ impl RegionFile {
             self.file.sync_data()?;
             self.sectors_written = false;
         }
-        let directory = self.path.parent().unwrap_or(Path::new(".")).to_owned();
         if self.externals_written {
-            crate::fs_sync::sync_dir(&directory)?;
+            crate::fs_sync::sync_dir(self.path.parent().unwrap_or(Path::new(".")))?;
             self.externals_written = false;
         }
         self.write_header()?;
         self.file.sync_data()?;
         self.header_staged = false;
+        self.release_old()
+    }
+
+    /// For a file that is only a cache: the staged header goes to the file
+    /// now, without waiting for the disk, and the old sectors are free at
+    /// once. The writes survive the process ending, but a power cut may lose
+    /// the chunks written since the last `sync` or read them as another
+    /// chunk's bytes. Whatever must survive a power cut uses `sync`.
+    pub fn flush(&mut self) -> io::Result<()> {
+        if !self.header_staged {
+            return Ok(());
+        }
+        self.write_header()?;
+        self.header_staged = false;
+        self.release_old()
+    }
+
+    /// The old sectors are free and the `.mcc` files no chunk uses are gone,
+    /// now that the header no longer names them.
+    fn release_old(&mut self) -> io::Result<()> {
         for (start, count) in std::mem::take(&mut self.pending_free) {
             self.free(start, count);
         }
+        let directory = self.path.parent().unwrap_or(Path::new(".")).to_owned();
         for i in std::mem::take(&mut self.pending_removals) {
             remove_if_exists(&external_path(&directory, position(self.position, i)))?;
         }
@@ -986,6 +1006,43 @@ mod tests {
         region.sync().unwrap();
         assert!(mcc.exists());
         assert_eq!(read().compressed, big.compressed);
+        drop(region);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `flush` (a cache's commit) puts the header in the file for another
+    /// handle without a sync, and frees the old sectors at once.
+    #[test]
+    fn a_flushed_write_is_in_the_file_and_frees_its_old_sectors() {
+        let dir = std::env::temp_dir().join(format!("horizon-region-flush-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.0.0.mca");
+        let record = |fill: u8| ChunkRecord {
+            compression: Compression::None,
+            compressed: vec![fill; 5000],
+            timestamp: u32::from(fill),
+        };
+        let chunk = ChunkPos::new(1, 2);
+        let mut region = RegionFile::open_writable(&path, true).unwrap();
+        // Two sectors each: 2..4, then 4..6, then 2..4 again.
+        region.write(chunk, &record(1)).unwrap();
+        region.flush().unwrap();
+        let read = || {
+            RegionFile::open(&path)
+                .unwrap()
+                .read(chunk)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(read().compressed, record(1).compressed);
+        region.write(chunk, &record(2)).unwrap();
+        region.flush().unwrap();
+        assert_eq!(read().compressed, record(2).compressed);
+        region.write(chunk, &record(3)).unwrap();
+        assert_eq!(
+            region.offsets[slot(region.position, chunk).unwrap()] >> 8,
+            2
+        );
         drop(region);
         let _ = std::fs::remove_dir_all(&dir);
     }
