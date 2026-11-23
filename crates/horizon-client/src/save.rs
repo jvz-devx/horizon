@@ -1999,7 +1999,10 @@ fn write_region_records(
                 None => changed |= region.clear(*pos, timestamp)?,
             }
         }
-        if changed {
+        // A clear retried after a failed sync changes nothing: the header in
+        // memory has the chunk gone already, but only a sync puts it on the
+        // disk.
+        if changed || region.has_staged_changes() {
             region.sync()?;
         }
     }

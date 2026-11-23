@@ -137,10 +137,6 @@ pub struct RegionFile {
     /// Whether this handle created the file and the folder that names it has
     /// not been synced since: until it is, a power cut can lose the file.
     name_unsynced: bool,
-    /// The folders this handle created for the file, outermost first, whose
-    /// names their parents have not had synced since: until they are, a
-    /// power cut can lose the folder and the file in it.
-    new_folders: Vec<PathBuf>,
     /// The chunk places of the header last written to the file: what a
     /// reader after a power cut finds, while `offsets` has changes staged.
     durable: [u32; 1024],
@@ -158,6 +154,13 @@ pub struct RegionFile {
     /// failed after a header that no longer names it was written.
     pending_removals: Vec<usize>,
 }
+
+/// The folders `open_writable` created whose names their parents have not
+/// had synced yet: until they are, a power cut can lose the folder and the
+/// files in it. Shared by every handle, so the first region in one to sync
+/// syncs its name, whichever handle created it.
+static NEW_FOLDERS: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// How a header write was started: by `sync` or by `flush`.
 #[derive(Clone, Copy)]
@@ -314,10 +317,10 @@ fn read_record(
         timestamp,
     }))
 }
-/// `folder` and its missing ancestors created, one at a time: the ones this
-/// call made, outermost first. One another process makes meanwhile is
-/// theirs to sync.
-fn create_folders(folder: &Path) -> io::Result<Vec<PathBuf>> {
+/// `folder` and its missing ancestors created, one at a time, each one made
+/// added to [`NEW_FOLDERS`]. One another process makes meanwhile is theirs
+/// to sync.
+fn create_folders(folder: &Path) -> io::Result<()> {
     let mut missing = Vec::new();
     let mut at = folder;
     while !at.as_os_str().is_empty() && !at.exists() {
@@ -327,15 +330,19 @@ fn create_folders(folder: &Path) -> io::Result<Vec<PathBuf>> {
             None => break,
         }
     }
-    let mut created = Vec::new();
     for folder in missing.into_iter().rev() {
         match fs::create_dir(&folder) {
-            Ok(()) => created.push(folder),
+            Ok(()) => {
+                new_folders().insert(folder);
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists && folder.is_dir() => {}
             Err(e) => return Err(e),
         }
     }
-    Ok(created)
+    Ok(())
+}
+fn new_folders() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<PathBuf>> {
+    NEW_FOLDERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 fn remove_if_exists(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
@@ -362,10 +369,9 @@ impl RegionFile {
         let path = path.as_ref().to_owned();
         let mut options = OpenOptions::new();
         options.read(true).write(true);
-        let mut new_folders = Vec::new();
         let (file, created) = if create {
             position_from_path(&path)?;
-            new_folders = create_folders(path.parent().unwrap_or(Path::new("")))?;
+            create_folders(path.parent().unwrap_or(Path::new("")))?;
             match options.clone().create_new(true).open(&path) {
                 Ok(file) => (file, true),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (options.open(&path)?, false),
@@ -376,7 +382,6 @@ impl RegionFile {
         };
         let mut region = Self::from_file(path, Disk::File(file))?;
         region.name_unsynced = created;
-        region.new_folders = new_folders;
         Ok(region)
     }
 
@@ -395,7 +400,6 @@ impl RegionFile {
             sectors_written: false,
             externals_written: false,
             name_unsynced: false,
-            new_folders: Vec::new(),
             durable: offsets,
             commit_unfinished: None,
             pending_free: Vec::new(),
@@ -646,6 +650,12 @@ impl RegionFile {
         self.remove_unused_externals()
     }
 
+    /// Whether writes or clears are staged that no `sync` or `flush` has
+    /// put in the file yet, a failed one included.
+    pub fn has_staged_changes(&self) -> bool {
+        self.header_staged
+    }
+
     /// A header commit that failed partway finished the way it started,
     /// before the header in memory changes again.
     fn finish_commit(&mut self) -> io::Result<()> {
@@ -658,12 +668,18 @@ impl RegionFile {
 
     /// The folder synced, if a `.mcc` was renamed into it or this handle
     /// created the region file since it last was; and the parent of each
-    /// folder this handle created, outermost first.
+    /// folder the file is in that is in [`NEW_FOLDERS`], outermost first.
     fn sync_folder(&mut self) -> io::Result<()> {
-        for folder in &self.new_folders {
+        // A path sorts after its ancestors, so outermost first.
+        let unsynced: Vec<PathBuf> = new_folders()
+            .iter()
+            .filter(|folder| self.path.starts_with(folder))
+            .cloned()
+            .collect();
+        for folder in unsynced {
             crate::fs_sync::sync_dir(folder.parent().unwrap_or(Path::new("")))?;
+            new_folders().remove(&folder);
         }
-        self.new_folders.clear();
         if self.externals_written || self.name_unsynced {
             crate::fs_sync::sync_dir(self.path.parent().unwrap_or(Path::new(".")))?;
             self.externals_written = false;
@@ -2002,6 +2018,15 @@ mod tests {
         assert_eq!(read_cached(&folder, &drive), Some((0, 2)));
     }
 
+    /// The folders under `dir` waiting for their names to be synced.
+    fn unsynced_under(dir: &Path) -> Vec<PathBuf> {
+        new_folders()
+            .iter()
+            .filter(|f| f.starts_with(dir))
+            .cloned()
+            .collect()
+    }
+
     /// A region created in folders that are not there yet: the handle makes
     /// them, and its first `sync` syncs the parent of each, outermost first,
     /// then the file's own folder. The next sync syncs no folder.
@@ -2012,7 +2037,7 @@ mod tests {
         let folder = sky.join("region");
         let mut region = RegionFile::open_writable(folder.join("r.0.0.mca"), true).unwrap();
         assert_eq!(
-            region.new_folders,
+            unsynced_under(&dir),
             [dimensions.clone(), sky.clone(), folder.clone()]
         );
         region
@@ -2024,11 +2049,56 @@ mod tests {
             crate::fs_sync::SYNCED.with(|s| s.take()),
             [dir.to_path_buf(), dimensions, sky, folder]
         );
-        assert!(region.new_folders.is_empty());
+        assert!(unsynced_under(&dir).is_empty());
         region
             .write(ChunkPos::new(1, 0), &slot_0(Compression::None, 2, false))
             .unwrap();
         region.sync().unwrap();
         assert!(crate::fs_sync::SYNCED.with(|s| s.take()).is_empty());
+    }
+
+    /// A handle that made a region's folders and never synced leaves their
+    /// names to the next region in them to sync: a sibling region can't
+    /// acknowledge a save while the folder it is in may be lost.
+    #[test]
+    fn a_sibling_region_syncs_the_folders_another_handle_made() {
+        let dir = scratch_folder();
+        let folder = dir.join("entities");
+        drop(RegionFile::open_writable(folder.join("r.0.0.mca"), true).unwrap());
+        assert_eq!(unsynced_under(&dir), std::slice::from_ref(&folder));
+        let mut sibling = RegionFile::open_writable(folder.join("r.1.0.mca"), true).unwrap();
+        sibling
+            .write(ChunkPos::new(32, 0), &slot_0(Compression::None, 1, false))
+            .unwrap();
+        crate::fs_sync::SYNCED.with(|s| s.borrow_mut().clear());
+        sibling.sync().unwrap();
+        assert_eq!(
+            crate::fs_sync::SYNCED.with(|s| s.take()),
+            [dir.to_path_buf(), folder]
+        );
+        assert!(unsynced_under(&dir).is_empty());
+    }
+
+    /// A clear whose sync failed is still staged: retried, the clear finds
+    /// nothing to change, and the region says it has changes to sync.
+    #[test]
+    fn a_clear_retried_after_a_failed_sync_is_still_staged() {
+        let folder = scratch_folder();
+        let (mut region, drive) = sim_region(&folder);
+        let chunk = position(region.position, 0);
+        region
+            .write(chunk, &slot_0(Compression::None, 1, false))
+            .unwrap();
+        region.sync().unwrap();
+        assert!(!region.has_staged_changes());
+        assert!(region.clear(chunk, 2).unwrap());
+        let ops = drive.borrow().ops;
+        drive.borrow_mut().fail = Some(ops);
+        assert!(region.sync().is_err());
+        assert!(!region.clear(chunk, 3).unwrap());
+        assert!(region.has_staged_changes());
+        region.sync().unwrap();
+        assert!(!region.has_staged_changes());
+        assert_eq!(read_cached(&folder, &drive), None);
     }
 }
