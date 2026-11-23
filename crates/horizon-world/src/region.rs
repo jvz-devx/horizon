@@ -147,6 +147,11 @@ pub struct RegionFile {
     /// Whether this handle took over an unfinished commit from a handle
     /// closed before it ([`UNCOMMITTED`]).
     inherited_commit: bool,
+    /// Opened for writing. Only such a handle takes over a header a closed
+    /// one left unfinished, or leaves one: a read-only handle reads through
+    /// that header but cannot commit it, and the header it would leave goes
+    /// stale once a writer commits a newer one.
+    writable: bool,
     /// The sectors of the chunks written or cleared since the last `sync`
     /// (start, count). The header in the file may still point to them, so
     /// they are freed only once the new header is on the disk.
@@ -376,7 +381,7 @@ impl RegionFile {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_owned();
         let file = File::open(&path)?;
-        Self::from_file(path, Disk::File(file))
+        Self::from_file(path, Disk::File(file), false)
     }
 
     /// Open for reading and in-place writes (`write`, `clear`, made durable
@@ -405,10 +410,10 @@ impl RegionFile {
         } else {
             options.open(&path)?
         };
-        Self::from_file(path, Disk::File(file))
+        Self::from_file(path, Disk::File(file), true)
     }
 
-    fn from_file(path: PathBuf, mut file: Disk) -> io::Result<Self> {
+    fn from_file(path: PathBuf, mut file: Disk, writable: bool) -> io::Result<Self> {
         let position = position_from_path(&path)?;
         let (offsets, timestamps) = read_header(&mut file)?;
         let mut region = Self {
@@ -426,21 +431,25 @@ impl RegionFile {
             durable_timestamps: timestamps,
             commit_unfinished: None,
             inherited_commit: false,
+            writable,
             pending_free: Vec::new(),
             pending_removals: Vec::new(),
         };
         region.mark_used();
         let left = uncommitted().get(&region.path).cloned();
         if let Some(header) = left {
-            // A commit a closed handle left unfinished: its whole header is
-            // staged in place of the one read, which may be torn, and the
-            // next write or clear writes and syncs it before it allocates
-            // a sector.
+            // A commit a closed handle left unfinished: its whole header
+            // stands in for the one read, which may be torn. A writable
+            // handle stages it, and the next write or clear writes and syncs
+            // it before it allocates a sector; a read-only one only reads
+            // through it.
             (region.offsets, region.timestamps) = *header;
             region.mark_used();
-            region.header_staged = true;
-            region.commit_unfinished = Some(Commit::Sync);
-            region.inherited_commit = true;
+            if writable {
+                region.header_staged = true;
+                region.commit_unfinished = Some(Commit::Sync);
+                region.inherited_commit = true;
+            }
         }
         Ok(region)
     }
@@ -950,7 +959,10 @@ impl Drop for RegionFile {
     /// ([`UNCOMMITTED`]).
     fn drop(&mut self) {
         if self.header_staged {
-            if self.sync().is_err() && matches!(self.commit_unfinished, Some(Commit::Sync)) {
+            if self.sync().is_err()
+                && self.writable
+                && matches!(self.commit_unfinished, Some(Commit::Sync))
+            {
                 uncommitted().insert(self.path.clone(), Box::new((self.offsets, self.timestamps)));
             }
         } else if !self.pending_removals.is_empty() {
@@ -1717,7 +1729,7 @@ mod tests {
         let folder = scratch_folder();
         let drive = Rc::new(RefCell::new(sim::Drive::new(cut, folder.to_path_buf())));
         let disk = Disk::Sim(sim::Handle::new(drive.clone()));
-        let mut region = RegionFile::from_file(folder.join("r.0.0.mca"), disk).unwrap();
+        let mut region = RegionFile::from_file(folder.join("r.0.0.mca"), disk, true).unwrap();
         let mut rng = Rng(seed);
         let mut acked = vec![None; workload.slots];
         let mut version = 0;
@@ -1796,8 +1808,8 @@ mod tests {
         }
         let drive = Rc::new(RefCell::new(sim::Drive::synced(image)));
         let disk = Disk::Sim(sim::Handle::new(drive));
-        let mut region =
-            RegionFile::from_file(folder.join("r.0.0.mca"), disk).expect("a crash image opens");
+        let mut region = RegionFile::from_file(folder.join("r.0.0.mca"), disk, true)
+            .expect("a crash image opens");
         let batch = batches.iter().find(|b| b.start <= cut && cut < b.end);
         let (mut lost, mut wrong) = (0, 0);
         for s in 0..batches[0].before.len() {
@@ -1896,7 +1908,7 @@ mod tests {
                 folder.to_path_buf(),
             )));
             let disk = Disk::Sim(sim::Handle::new(drive.clone()));
-            let mut region = RegionFile::from_file(folder.join("r.0.0.mca"), disk).unwrap();
+            let mut region = RegionFile::from_file(folder.join("r.0.0.mca"), disk, true).unwrap();
             let (a, b) = (position(region.position, 0), position(region.position, 1));
             let ops = || drive.borrow().ops;
             let start = ops();
@@ -1939,6 +1951,7 @@ mod tests {
             Disk::Sim(sim::Handle::new(Rc::new(RefCell::new(sim::Drive::synced(
                 image.0.clone(),
             ))))),
+            true,
         )
         .unwrap();
         let read = region.read(position(region.position, 0)).unwrap();
@@ -2083,7 +2096,7 @@ mod tests {
     fn sim_region(folder: &Path) -> (RegionFile, Rc<RefCell<sim::Drive>>) {
         let drive = Rc::new(RefCell::new(sim::Drive::new(None, folder.to_path_buf())));
         let disk = Disk::Sim(sim::Handle::new(drive.clone()));
-        let region = RegionFile::from_file(folder.join("r.0.0.mca"), disk).unwrap();
+        let region = RegionFile::from_file(folder.join("r.0.0.mca"), disk, true).unwrap();
         (region, drive)
     }
     /// What a reader finds in `folder` if every write so far reached the
@@ -2106,7 +2119,7 @@ mod tests {
         let disk = Disk::Sim(sim::Handle::new(Rc::new(RefCell::new(sim::Drive::synced(
             bytes,
         )))));
-        let mut reader = RegionFile::from_file(folder.join("r.0.0.mca"), disk).unwrap();
+        let mut reader = RegionFile::from_file(folder.join("r.0.0.mca"), disk, true).unwrap();
         (0..slots)
             .map(|s| {
                 let record = reader.read(position(reader.position, s)).unwrap();
@@ -2329,7 +2342,7 @@ mod tests {
         drive.borrow_mut().fail = Some(ops + 1);
         drop(region);
         let disk = Disk::Sim(sim::Handle::new(drive.clone()));
-        let mut region = RegionFile::from_file(folder.join("r.0.0.mca"), disk).unwrap();
+        let mut region = RegionFile::from_file(folder.join("r.0.0.mca"), disk, true).unwrap();
         assert!(region.has_staged_changes());
         // A chunk of the same size in another slot: the first free sectors
         // must not be the ones the header on the disk names for slot 0.
@@ -2386,7 +2399,7 @@ mod tests {
         drive.borrow_mut().fail = Some(ops);
         drop(region);
         let disk = Disk::Sim(sim::Handle::new(drive.clone()));
-        let mut region = RegionFile::from_file(folder.join("r.0.0.mca"), disk).unwrap();
+        let mut region = RegionFile::from_file(folder.join("r.0.0.mca"), disk, true).unwrap();
         region
             .write(position(region.position, 2), &record(2, 3))
             .unwrap();
@@ -2398,6 +2411,72 @@ mod tests {
         assert_eq!(
             read_image_slots(&folder, synced, 3),
             [(Some((0, 2)), 2), (Some((1, 2)), 2), (Some((2, 3)), 3)]
+        );
+    }
+
+    /// A read-only handle opened while a closed handle's header commit is
+    /// pending reads through that header but does not take the commit over:
+    /// once a writer has committed a newer header, the reader's close leaves
+    /// nothing for the next handle to replay over it.
+    #[test]
+    fn a_read_only_handle_reads_a_pending_header_without_taking_its_commit() {
+        let folder = scratch_folder();
+        let (mut region, drive) = sim_region(&folder);
+        let record = |s, v| ChunkRecord {
+            compression: Compression::None,
+            compressed: tagged(s, v, 100),
+            timestamp: v,
+        };
+        let open = |writable| {
+            let disk = Disk::Sim(sim::Handle::new(drive.clone()));
+            RegionFile::from_file(folder.join("r.0.0.mca"), disk, writable).unwrap()
+        };
+        region
+            .write(position(region.position, 0), &record(0, 1))
+            .unwrap();
+        region.sync().unwrap();
+        region
+            .write(position(region.position, 0), &record(0, 2))
+            .unwrap();
+        // The sectors' sync, then the header write fails, and so does the
+        // retry in `Drop`: the header naming version 2 is left pending.
+        let ops = drive.borrow().ops;
+        drive.borrow_mut().fail = Some(ops + 1);
+        assert!(region.sync().is_err());
+        let ops = drive.borrow().ops;
+        drive.borrow_mut().fail = Some(ops);
+        drop(region);
+        assert!(uncommitted().contains_key(&folder.join("r.0.0.mca")));
+
+        let mut reader = open(false);
+        assert!(!reader.has_staged_changes());
+        let read = reader.read(position(reader.position, 0)).unwrap();
+        assert_eq!(read.as_ref().and_then(untag_record), Some((0, 2)));
+        // A writer commits the pending header, then a newer one, and reuses
+        // version 2's sectors once that one is synced.
+        let mut writer = open(true);
+        for (s, v) in [(0, 3), (1, 1)] {
+            writer
+                .write(position(writer.position, s), &record(s, v))
+                .unwrap();
+        }
+        writer.sync().unwrap();
+        writer
+            .write(position(writer.position, 2), &record(2, 1))
+            .unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+        // The reader's close: a write on its read-only file fails.
+        let ops = drive.borrow().ops;
+        drive.borrow_mut().fail = Some(ops);
+        drop(reader);
+        drive.borrow_mut().fail = None;
+
+        assert!(!uncommitted().contains_key(&folder.join("r.0.0.mca")));
+        let synced = drive.borrow().synced_bytes();
+        assert_eq!(
+            read_image_slots(&folder, synced, 3),
+            [(Some((0, 3)), 3), (Some((1, 1)), 1), (Some((2, 1)), 1)]
         );
     }
 }
