@@ -2391,6 +2391,8 @@ mod tests {
             .write(position(region.position, 2), &record(2, 3))
             .unwrap();
         region.sync().unwrap();
+        // Read back as written, with no pending header to stand in for it.
+        assert!(!uncommitted().contains_key(&folder.join("r.0.0.mca")));
         let synced = drive.borrow().synced_bytes();
         // Each chunk's new version, under its own timestamp.
         assert_eq!(
