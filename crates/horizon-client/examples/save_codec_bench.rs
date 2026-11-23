@@ -319,12 +319,13 @@ fn spread(samples: &mut [f64]) -> String {
 }
 
 /// The value after `name`, `None` when the flag is absent; a flag with no
-/// value or one that doesn't parse is an error, not the default.
+/// value (the next argument another flag) or one that doesn't parse is an
+/// error, not the default.
 fn flag<T: std::str::FromStr>(args: &[String], name: &str) -> Result<Option<T>, Error> {
     let Some(i) = args.iter().position(|a| a == name) else {
         return Ok(None);
     };
-    match args.get(i + 1).map(|v| v.parse()) {
+    match args.get(i + 1).filter(|v| !v.starts_with("--")).map(|v| v.parse()) {
         Some(Ok(value)) => Ok(Some(value)),
         _ => Err(format!("{name} needs a valid value").into()),
     }
