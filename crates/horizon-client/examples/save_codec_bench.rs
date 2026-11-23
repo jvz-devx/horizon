@@ -52,10 +52,11 @@ type Error = Box<dyn std::error::Error>;
 
 /// A folder this run made under `parent`, removed with everything in it
 /// when dropped. A name already taken is skipped, never cleared, and
-/// `parent` itself is never removed.
+/// `parent` (made if missing) is never removed.
 struct Scratch(PathBuf);
 impl Scratch {
     fn new(parent: &Path, name: &str) -> std::io::Result<Self> {
+        std::fs::create_dir_all(parent)?;
         let mut n = 0u32;
         loop {
             let dir = parent.join(format!("{name}-{}-{n}", std::process::id()));
@@ -317,17 +318,23 @@ fn spread(samples: &mut [f64]) -> String {
     )
 }
 
-fn flag<T: std::str::FromStr>(args: &[String], name: &str) -> Option<T> {
-    args.iter()
-        .position(|a| a == name)
-        .and_then(|i| args.get(i + 1)?.parse().ok())
+/// The value after `name`, `None` when the flag is absent; a flag with no
+/// value or one that doesn't parse is an error, not the default.
+fn flag<T: std::str::FromStr>(args: &[String], name: &str) -> Result<Option<T>, Error> {
+    let Some(i) = args.iter().position(|a| a == name) else {
+        return Ok(None);
+    };
+    match args.get(i + 1).map(|v| v.parse()) {
+        Some(Ok(value)) => Ok(Some(value)),
+        _ => Err(format!("{name} needs a valid value").into()),
+    }
 }
 
 fn main() -> Result<(), Error> {
     let args: Vec<String> = std::env::args().collect();
-    let count: usize = flag(&args, "--chunks").unwrap_or(4096);
-    let rounds: usize = flag(&args, "--rounds").unwrap_or(5);
-    let threads: usize = flag(&args, "--threads")
+    let count: usize = flag(&args, "--chunks")?.unwrap_or(4096);
+    let rounds: usize = flag(&args, "--rounds")?.unwrap_or(5);
+    let threads: usize = flag(&args, "--threads")?
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     for (name, value) in [
         ("--chunks", count),
@@ -339,7 +346,7 @@ fn main() -> Result<(), Error> {
         }
     }
     let scratch = Scratch::new(
-        &flag::<PathBuf>(&args, "--scratch").unwrap_or_else(std::env::temp_dir),
+        &flag::<PathBuf>(&args, "--scratch")?.unwrap_or_else(std::env::temp_dir),
         "horizon-save-codec",
     )?;
     let (registry, biomes) = fixture()?;
@@ -353,7 +360,7 @@ fn main() -> Result<(), Error> {
     };
 
     let (chunks, nbt_bytes): (Vec<Arc<Chunk>>, Vec<Vec<u8>>) =
-        if let Some(world) = flag::<PathBuf>(&args, "--world") {
+        if let Some(world) = flag::<PathBuf>(&args, "--world")? {
             // Region files in name order, so the same world gives the same
             // sample whatever order the folder lists them in; reading stops
             // at `--chunks` records. Only `r.X.Z.mca` files: the `.mcc`
