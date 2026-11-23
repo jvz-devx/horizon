@@ -693,10 +693,24 @@ impl RegionFile {
             .collect();
         slots.extend(changed);
         for i in slots {
-            if !self.stub_is_external(self.durable[i]).unwrap_or(true) {
+            if !self.stub_may_be_external(self.durable[i]) {
                 self.pending_removals.push(i);
             }
         }
+    }
+
+    /// Whether the record at `offset` may be an external chunk's stub: yes
+    /// unless all five bytes of its record header read back and say inline.
+    fn stub_may_be_external(&mut self, offset: u32) -> bool {
+        if offset == 0 {
+            return false;
+        }
+        let mut header = [0; 5];
+        let read = self
+            .file
+            .seek(SeekFrom::Start(u64::from(offset >> 8) * SECTOR as u64))
+            .and_then(|_| self.file.read_exact(&mut header));
+        read.is_err() || header[4] & 128 != 0
     }
 
     /// Whether writes or clears are staged that no `sync` or `flush` has
