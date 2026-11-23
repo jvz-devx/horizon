@@ -1903,13 +1903,21 @@ impl RegionFiles {
     /// Close the least recently used regions until there is room for one
     /// more, as `RegionFileStorage.getRegionFile` does. A region a reader or
     /// the writer still holds stays: closing it under them would let a
-    /// second handle read a header older than its sectors.
+    /// second handle read a header older than its sectors. So does one with
+    /// changes a failed sync left staged: opened again, it would take the
+    /// header in the file, maybe not the one on the disk, and reuse sectors
+    /// that header on the disk still names.
     fn make_room(&mut self) {
         while self.regions.len() >= MAX_OPEN_REGIONS {
             let oldest = self
                 .regions
                 .iter()
-                .filter(|(_, (r, _))| r.as_ref().is_none_or(|r| Arc::strong_count(r) == 1))
+                .filter(|(_, (r, _))| {
+                    r.as_ref().is_none_or(|r| {
+                        Arc::strong_count(r) == 1
+                            && r.try_lock().is_ok_and(|r| !r.has_staged_changes())
+                    })
+                })
                 .min_by_key(|(_, (_, used))| *used)
                 .map(|(key, _)| *key);
             let Some(key) = oldest else {
