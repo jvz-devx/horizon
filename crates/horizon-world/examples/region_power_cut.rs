@@ -24,10 +24,11 @@
 //!   gone (neither `RegionFile` nor `SaveDir` syncs the folder).
 //!
 //! Then `RegionFile::open` reads every acknowledged chunk back. Its last
-//! acknowledged version or a later one is fine; nothing, an older version or an
-//! unreadable record is lost; another chunk's record is a wrong-key read. Another
-//! store drives the same [`Recorder`] (`changed` after each write, `synced`,
-//! `folder_synced`, `acknowledged`).
+//! acknowledged version or a later one, with the payload that version was
+//! written with, is fine; nothing, an older version, an unreadable record or a
+//! payload with damaged bytes is lost; another chunk's record is a wrong-key
+//! read. Another store drives the same [`Recorder`] (`changed` after each
+//! write, `synced`, `folder_synced`, `acknowledged`).
 use horizon_core::{
     nbt::{Limits, NamedTag, Tag},
     position::ChunkPos,
@@ -78,6 +79,9 @@ enum Event {
 struct Recorder {
     files: Vec<(PathBuf, Vec<u8>)>,
     events: Vec<Event>,
+    /// Each chunk version's payload as written: nothing in a record checks
+    /// its bytes, so a torn sector inside it would otherwise read as fine.
+    payloads: HashMap<((i32, i32), u32), Vec<u8>>,
 }
 impl Recorder {
     /// Records what changed in `path` since it was last seen.
@@ -253,15 +257,32 @@ fn check(
             Some(Tag::Int(v)) => Some(*v),
             _ => None,
         };
+        let intact = |tag: &NamedTag, read: u32| match tag.tag.get("filler") {
+            Some(Tag::ByteArray(bytes)) => recorder.payloads.get(&((x, z), read)) == Some(bytes),
+            _ => false,
+        };
         match read {
             Some(tag) if (field(&tag, "xPos"), field(&tag, "zPos")) != (Some(x), Some(z)) => {
                 outcome.wrong_key += 1
             }
-            Some(tag) if field(&tag, "version").is_some_and(|v| v as u32 >= version) => {}
+            Some(tag)
+                if field(&tag, "version")
+                    .is_some_and(|v| v as u32 >= version && intact(&tag, v as u32)) => {}
             _ => outcome.lost += 1,
         }
     }
     Ok(outcome)
+}
+
+/// Refuses a workload whose first rounds would pick from no chunks.
+fn check_bounds(chunks: usize) -> io::Result<()> {
+    if chunks < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--chunks must be at least 2: the first half of the rounds writes half of them",
+        ));
+    }
+    Ok(())
 }
 
 /// The workload: `rounds` batches written and synced region by region, as `SaveDir` does.
@@ -272,6 +293,7 @@ fn workload(
     (chunks, batch, rounds): (usize, usize, usize),
     sync_folder: bool,
 ) -> io::Result<Recorder> {
+    check_bounds(chunks)?;
     let mut rng = Rng(seed);
     let mut recorder = Recorder::default();
     let mut versions: HashMap<(i32, i32), u32> = HashMap::new();
@@ -319,9 +341,10 @@ fn workload(
                         ("xPos", Tag::Int(key.0)),
                         ("zPos", Tag::Int(key.1)),
                         ("version", Tag::Int(*version as i32)),
-                        ("filler", Tag::ByteArray(filler)),
+                        ("filler", Tag::ByteArray(filler.clone())),
                     ]),
                 };
+                recorder.payloads.insert((key, *version), filler);
                 let record = ChunkRecord::from_nbt(&root, Compression::None, 0, Limits::default())?;
                 region.write(ChunkPos::new(key.0, key.1), &record)?;
                 recorder.changed(&path)?;
@@ -351,6 +374,7 @@ fn main() -> io::Result<()> {
         flag(&args, "--batch", 24) as usize,
         flag(&args, "--rounds", 12) as usize,
     );
+    check_bounds(chunks)?;
     let root = std::env::temp_dir().join(format!("horizon-power-cut-{}", std::process::id()));
     let (work, scratch) = (root.join("work"), root.join("crashed"));
     fs::create_dir_all(&work)?;
@@ -421,6 +445,55 @@ mod tests {
             assert_eq!(outcome, Outcome::default(), "cut after {cut} calls");
         }
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A record whose identity fields survive but one interior 512-byte
+    /// sector of its filler doesn't still decodes: `check` counts it lost.
+    #[test]
+    fn a_damaged_payload_sector_counts_as_lost() {
+        let (recorder, dir) = run(12);
+        let (mut images, acknowledged) = crash(
+            &recorder,
+            recorder.events.len(),
+            Model::Ordered,
+            &mut Rng(1),
+        );
+        let crashed = dir.join("crashed");
+        assert_eq!(
+            check(&recorder, &images, &acknowledged, &crashed).unwrap(),
+            Outcome::default()
+        );
+        // The first acknowledged chunk of the first region with a record of
+        // at least four sectors: its third sector is filler.
+        let image = images[0].as_mut().unwrap();
+        let record = (0..1024)
+            .map(|i| u32::from_be_bytes(image[i * 4..i * 4 + 4].try_into().unwrap()))
+            .filter(|&offset| offset != 0)
+            .map(|offset| (offset >> 8) as usize * 4096)
+            .find(|&at| u32::from_be_bytes(image[at..at + 4].try_into().unwrap()) >= 4 * 512)
+            .expect("a record of four sectors or more");
+        image[record + 2 * 512..record + 3 * 512].fill(0);
+        assert_eq!(
+            check(&recorder, &images, &acknowledged, &crashed).unwrap(),
+            Outcome {
+                lost: 1,
+                wrong_key: 0
+            }
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn workloads_without_chunks_to_pick_are_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-power-cut-test-{}-bounds",
+            std::process::id()
+        ));
+        for chunks in [0, 1] {
+            let error = workload(&dir, 1, (chunks, 8, 4), false).err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+        assert!(!dir.exists());
     }
 
     #[test]

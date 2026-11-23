@@ -291,6 +291,15 @@ fn main() -> Result<(), Error> {
     let rounds: usize = flag(&args, "--rounds").unwrap_or(5);
     let threads: usize = flag(&args, "--threads")
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    for (name, value) in [
+        ("--chunks", count),
+        ("--rounds", rounds),
+        ("--threads", threads),
+    ] {
+        if value == 0 {
+            return Err(format!("{name} must be at least 1").into());
+        }
+    }
     let scratch: PathBuf = flag(&args, "--scratch")
         .unwrap_or_else(std::env::temp_dir)
         .join(format!("horizon-save-codec-{}", std::process::id()));
@@ -306,17 +315,29 @@ fn main() -> Result<(), Error> {
 
     let (chunks, nbt_bytes): (Vec<Arc<Chunk>>, Vec<Vec<u8>>) =
         if let Some(world) = flag::<PathBuf>(&args, "--world") {
+            // Region files in name order, so the same world gives the same
+            // sample whatever order the folder lists them in; reading stops
+            // at `--chunks` records.
+            let mut paths = std::fs::read_dir(world.join("region"))?
+                .map(|entry| Ok(entry?.path()))
+                .collect::<std::io::Result<Vec<PathBuf>>>()?;
+            paths.sort();
             let mut records = Vec::new();
-            for entry in std::fs::read_dir(world.join("region"))? {
-                let mut region = RegionFile::open(entry?.path())?;
+            'regions: for path in paths {
+                let mut region = RegionFile::open(path)?;
                 let positions: Vec<_> = region.chunks().map(|(p, _)| p).collect();
                 for pos in positions {
+                    if records.len() == count {
+                        break 'regions;
+                    }
                     if let Some(record) = region.read(pos)? {
                         records.push(nbt::write_named(&record.nbt(limits)?, limits)?);
                     }
                 }
             }
-            records.truncate(count);
+            if records.is_empty() {
+                return Err("the world's region folder holds no chunk records".into());
+            }
             (Vec::new(), records)
         } else {
             let side = (count as f64).sqrt().ceil() as i32;
@@ -365,6 +386,8 @@ fn main() -> Result<(), Error> {
         "encode_with,write NBT,deflate (zlib-6),inflate,parse NBT,decode + light".split(',');
     let mut stages: Vec<(&str, Vec<f64>)> = names.map(|s| (s, Vec::new())).collect();
     let have_chunks = !chunks.is_empty();
+    // Without chunks, `encode_with` and `decode + light` don't run.
+    let ran = |name: &str| have_chunks || !matches!(name, "encode_with" | "decode + light");
     // Without chunks (`--world`), the roots aren't decoded either.
     let decoded = if have_chunks { &roots[..] } else { &[] };
     for _ in 0..rounds {
@@ -382,7 +405,7 @@ fn main() -> Result<(), Error> {
             .for_each(|((_, s), t)| s.push(t));
     }
     println!("\n| Stage | CPU µs/chunk |\n|---|---:|");
-    for (name, mut samples) in stages.into_iter().filter(|(_, s)| s[0] > 0.0) {
+    for (name, mut samples) in stages.into_iter().filter(|(name, _)| ran(name)) {
         println!("| {name} | {} |", spread(&mut samples));
     }
 
