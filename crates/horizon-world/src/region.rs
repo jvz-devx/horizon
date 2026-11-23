@@ -164,19 +164,13 @@ pub struct RegionFile {
 /// closed and opened again before its first sync still has its name synced.
 static NEW_NAMES: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
 
-/// The last committed header (offsets, timestamps) of each region file
-/// whose handle was closed while a `sync` that wrote a new header had not
-/// made it durable, its retry in `Drop` failing too: the file may hold a
-/// header that is not on the disk. The next handle on the file keeps the
-/// sectors that committed header names and finishes the commit before it
-/// writes, as the closed one would have.
-static UNCOMMITTED: std::sync::Mutex<
-    std::collections::BTreeMap<PathBuf, Box<([u32; 1024], [u32; 1024])>>,
-> = std::sync::Mutex::new(std::collections::BTreeMap::new());
-fn uncommitted() -> std::sync::MutexGuard<
-    'static,
-    std::collections::BTreeMap<PathBuf, Box<([u32; 1024], [u32; 1024])>>,
-> {
+/// The region files whose handle was closed while a `sync` that wrote a
+/// new header had not made it durable, its retry in `Drop` failing too: the
+/// file may hold a header that is not on the disk. The next handle on the
+/// file finishes that commit before its first write or clear allocates or
+/// changes anything, as the closed one would have.
+static UNCOMMITTED: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
+fn uncommitted() -> std::sync::MutexGuard<'static, BTreeSet<PathBuf>> {
     UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -430,30 +424,15 @@ impl RegionFile {
             pending_removals: Vec::new(),
         };
         region.mark_used();
-        let inherited = uncommitted().get(&region.path).cloned();
-        if let Some(committed) = inherited {
-            region.inherit_commit(*committed);
+        if uncommitted().contains(&region.path) {
+            // A commit a closed handle left unfinished: the header read
+            // from the file is staged again, and the next write or clear
+            // syncs it before it allocates a sector.
+            region.header_staged = true;
+            region.commit_unfinished = Some(Commit::Sync);
+            region.inherited_commit = true;
         }
         Ok(region)
-    }
-
-    /// A commit a closed handle left unfinished ([`UNCOMMITTED`]): the
-    /// header read from the file is staged again, the sectors of the
-    /// committed header stay taken until it is on the disk, and the next
-    /// write or clear finishes it first.
-    fn inherit_commit(&mut self, (offsets, timestamps): ([u32; 1024], [u32; 1024])) {
-        self.durable = offsets;
-        self.durable_timestamps = timestamps;
-        for (i, &offset) in offsets.iter().enumerate() {
-            if offset != 0 && offset != self.offsets[i] {
-                let (start, count) = ((offset >> 8) as usize, (offset & 255) as usize);
-                self.force(start, count);
-                self.pending_free.push((start, count));
-            }
-        }
-        self.header_staged = true;
-        self.commit_unfinished = Some(Commit::Sync);
-        self.inherited_commit = true;
     }
 
     /// The sectors in use as `offsets` places them, and the header's two.
@@ -962,10 +941,7 @@ impl Drop for RegionFile {
     fn drop(&mut self) {
         if self.header_staged {
             if self.sync().is_err() && matches!(self.commit_unfinished, Some(Commit::Sync)) {
-                uncommitted().insert(
-                    self.path.clone(),
-                    Box::new((self.durable, self.durable_timestamps)),
-                );
+                uncommitted().insert(self.path.clone());
             }
         } else if !self.pending_removals.is_empty() {
             let _ = self.remove_unused_externals();
@@ -2293,9 +2269,8 @@ mod tests {
 
     /// A handle closed after its header commit failed, the retry in `Drop`
     /// failing too: the file holds a header that is not on the disk. The
-    /// next handle on the file keeps the sectors the header on the disk
-    /// names and finishes the commit before it writes, so it never writes
-    /// over a chunk that header names.
+    /// next handle on the file finishes the commit before it writes, so it
+    /// never writes over a chunk the header on the disk names.
     #[test]
     fn a_region_reopened_after_a_failed_commit_finishes_it_before_writing() {
         let folder = scratch_folder();
@@ -2335,9 +2310,10 @@ mod tests {
             bytes[..HEADER].copy_from_slice(&drive.synced_bytes()[..HEADER]);
             bytes
         };
-        let read = read_image(&folder, image);
-        assert!(matches!(read, Some((0, 1 | 2))), "{read:?}");
+        // The write finished the commit first: the header on the disk is
+        // the one the closed handle wrote.
+        assert_eq!(read_image(&folder, image), Some((0, 2)));
         region.sync().unwrap();
-        assert!(!uncommitted().contains_key(&folder.join("r.0.0.mca")));
+        assert!(!uncommitted().contains(&folder.join("r.0.0.mca")));
     }
 }
