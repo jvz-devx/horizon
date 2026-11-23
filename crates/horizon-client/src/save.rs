@@ -1939,9 +1939,8 @@ fn cached_region(
         return Ok(cached.clone());
     }
     cache.make_room();
-    if create && let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    // `open_writable` makes the missing folders, and the region's first
+    // sync makes their names durable with the file's.
     // A file this process can't write (a read-only world) is still read.
     let region = match RegionFile::open_writable(path, create) {
         Err(e) if !create && e.kind() == std::io::ErrorKind::PermissionDenied => {

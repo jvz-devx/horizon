@@ -137,9 +137,18 @@ pub struct RegionFile {
     /// Whether this handle created the file and the folder that names it has
     /// not been synced since: until it is, a power cut can lose the file.
     name_unsynced: bool,
+    /// The folders this handle created for the file, outermost first, whose
+    /// names their parents have not had synced since: until they are, a
+    /// power cut can lose the folder and the file in it.
+    new_folders: Vec<PathBuf>,
     /// The chunk places of the header last written to the file: what a
     /// reader after a power cut finds, while `offsets` has changes staged.
     durable: [u32; 1024],
+    /// A header write that failed after it started, or whose sync failed:
+    /// the file may hold that header or the one before. `write` and `clear`
+    /// finish it first, the way it was started, so `durable` names what
+    /// the file holds before a `.mcc` is matched to it.
+    commit_unfinished: Option<Commit>,
     /// The sectors of the chunks written or cleared since the last `sync`
     /// (start, count). The header in the file may still point to them, so
     /// they are freed only once the new header is on the disk.
@@ -148,6 +157,13 @@ pub struct RegionFile {
     /// written inline or cleared since the last `sync`, and any whose removal
     /// failed after a header that no longer names it was written.
     pending_removals: Vec<usize>,
+}
+
+/// How a header write was started: by `sync` or by `flush`.
+#[derive(Clone, Copy)]
+enum Commit {
+    Sync,
+    Flush,
 }
 
 pub fn position_from_path(path: &Path) -> io::Result<ChunkPos> {
@@ -298,6 +314,29 @@ fn read_record(
         timestamp,
     }))
 }
+/// `folder` and its missing ancestors created, one at a time: the ones this
+/// call made, outermost first. One another process makes meanwhile is
+/// theirs to sync.
+fn create_folders(folder: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut missing = Vec::new();
+    let mut at = folder;
+    while !at.as_os_str().is_empty() && !at.exists() {
+        missing.push(at.to_owned());
+        match at.parent() {
+            Some(parent) => at = parent,
+            None => break,
+        }
+    }
+    let mut created = Vec::new();
+    for folder in missing.into_iter().rev() {
+        match fs::create_dir(&folder) {
+            Ok(()) => created.push(folder),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && folder.is_dir() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(created)
+}
 fn remove_if_exists(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
@@ -316,12 +355,17 @@ impl RegionFile {
     }
 
     /// Open for reading and in-place writes (`write`, `clear`, made durable
-    /// by `sync`), creating an empty region with `create`.
+    /// by `sync`), creating an empty region with `create`, and the folders
+    /// it goes in that are missing. The first `sync` makes the names of the
+    /// file and of the folders it created durable.
     pub fn open_writable(path: impl AsRef<Path>, create: bool) -> io::Result<Self> {
         let path = path.as_ref().to_owned();
         let mut options = OpenOptions::new();
         options.read(true).write(true);
+        let mut new_folders = Vec::new();
         let (file, created) = if create {
+            position_from_path(&path)?;
+            new_folders = create_folders(path.parent().unwrap_or(Path::new("")))?;
             match options.clone().create_new(true).open(&path) {
                 Ok(file) => (file, true),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (options.open(&path)?, false),
@@ -332,6 +376,7 @@ impl RegionFile {
         };
         let mut region = Self::from_file(path, Disk::File(file))?;
         region.name_unsynced = created;
+        region.new_folders = new_folders;
         Ok(region)
     }
 
@@ -350,7 +395,9 @@ impl RegionFile {
             sectors_written: false,
             externals_written: false,
             name_unsynced: false,
+            new_folders: Vec::new(),
             durable: offsets,
+            commit_unfinished: None,
             pending_free: Vec::new(),
             pending_removals: Vec::new(),
         };
@@ -418,12 +465,14 @@ impl RegionFile {
     /// An oversized chunk whose stub in the file's header names another
     /// codec is stored in that codec: its `.mcc` is replaced now, and a
     /// power cut before the next `sync` pairs the new bytes with the old
-    /// stub.
+    /// stub. The new stub is written before the `.mcc` is replaced, so a
+    /// write that fails leaves the chunk as it was.
     pub fn write(&mut self, chunk: ChunkPos, record: &ChunkRecord) -> io::Result<()> {
         let i = slot(self.position, chunk)?;
         if record.compressed.len() > MAX_COMPRESSED {
             return Err(invalid("compressed chunk limit exceeded"));
         }
+        self.finish_commit()?;
         let oversized =
             |record: &ChunkRecord| (record.compressed.len() + 5).div_ceil(SECTOR) >= 256;
         let durable_codec = if oversized(record) {
@@ -459,16 +508,14 @@ impl RegionFile {
         }
         let directory = self.path.parent().unwrap_or(Path::new(".")).to_owned();
         let external_file = external_path(&directory, chunk);
+        let temporary = directory.join(format!(".c.{}.{}.mcc.tmp", chunk.x, chunk.z));
         let mut data = Vec::with_capacity(sectors * SECTOR);
         if external {
-            let temporary = directory.join(format!(".c.{}.{}.mcc.tmp", chunk.x, chunk.z));
-            let written = File::create(&temporary)
-                .and_then(|mut f| {
-                    f.write_all(&record.compressed)?;
-                    // The region's sync only covers the stub, not this external payload.
-                    f.sync_all()
-                })
-                .and_then(|_| fs::rename(&temporary, &external_file));
+            let written = File::create(&temporary).and_then(|mut f| {
+                f.write_all(&record.compressed)?;
+                // The region's sync only covers the stub, not this external payload.
+                f.sync_all()
+            });
             if let Err(e) = written {
                 let _ = fs::remove_file(&temporary);
                 self.free(start, sectors);
@@ -482,11 +529,24 @@ impl RegionFile {
             data.extend_from_slice(&record.compressed);
         }
         data.resize(sectors * SECTOR, 0);
+        // The sectors first, then the `.mcc`: until the rename the chunk's
+        // stub in memory still names the `.mcc` it had, so a step that fails
+        // leaves the two matched.
         let written = self
             .file
             .seek(SeekFrom::Start((start * SECTOR) as u64))
-            .and_then(|_| self.file.write_all(&data));
+            .and_then(|_| self.file.write_all(&data))
+            .and_then(|_| {
+                if external {
+                    fs::rename(&temporary, &external_file)
+                } else {
+                    Ok(())
+                }
+            });
         if let Err(e) = written {
+            if external {
+                let _ = fs::remove_file(&temporary);
+            }
             self.free(start, sectors);
             return Err(e);
         }
@@ -516,6 +576,7 @@ impl RegionFile {
         if old == 0 {
             return Ok(false);
         }
+        self.finish_commit()?;
         self.offsets[i] = 0;
         self.timestamps[i] = timestamp;
         if !self.pending_removals.contains(&i) {
@@ -578,15 +639,31 @@ impl RegionFile {
             self.sectors_written = false;
         }
         self.sync_folder()?;
+        self.commit_unfinished = Some(Commit::Sync);
         self.write_header()?;
         self.file.sync_data()?;
         self.header_written();
         self.remove_unused_externals()
     }
 
+    /// A header commit that failed partway finished the way it started,
+    /// before the header in memory changes again.
+    fn finish_commit(&mut self) -> io::Result<()> {
+        match self.commit_unfinished {
+            Some(Commit::Sync) => self.sync(),
+            Some(Commit::Flush) => self.flush(),
+            None => Ok(()),
+        }
+    }
+
     /// The folder synced, if a `.mcc` was renamed into it or this handle
-    /// created the region file since it last was.
+    /// created the region file since it last was; and the parent of each
+    /// folder this handle created, outermost first.
     fn sync_folder(&mut self) -> io::Result<()> {
+        for folder in &self.new_folders {
+            crate::fs_sync::sync_dir(folder.parent().unwrap_or(Path::new("")))?;
+        }
+        self.new_folders.clear();
         if self.externals_written || self.name_unsynced {
             crate::fs_sync::sync_dir(self.path.parent().unwrap_or(Path::new(".")))?;
             self.externals_written = false;
@@ -602,6 +679,7 @@ impl RegionFile {
     /// chunk's bytes. Whatever must survive a power cut uses `sync`.
     pub fn flush(&mut self) -> io::Result<()> {
         if self.header_staged {
+            self.commit_unfinished = Some(Commit::Flush);
             self.write_header()?;
             self.header_written();
         }
@@ -610,6 +688,7 @@ impl RegionFile {
 
     /// The header in memory is the file's now: the old sectors are free.
     fn header_written(&mut self) {
+        self.commit_unfinished = None;
         self.header_staged = false;
         self.durable = self.offsets;
         for (start, count) in std::mem::take(&mut self.pending_free) {
@@ -969,9 +1048,7 @@ mod tests {
 
     #[test]
     fn allocation_matches_first_fit_from_zero() {
-        let dir =
-            std::env::temp_dir().join(format!("horizon-region-first-free-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_folder();
         let path = dir.join("r.0.0.mca");
         let mut region = RegionFile::open_writable(&path, true).unwrap();
 
@@ -1018,14 +1095,11 @@ mod tests {
             assert_eq!(region.used, naive);
             assert_eq!(region.first_free, naive_first_fit(&naive, 1));
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_kept_header_reads_the_chunks_of_its_file() {
-        let dir =
-            std::env::temp_dir().join(format!("horizon-region-header-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_folder();
         let path = dir.join("r.-1.2.mca");
         let record = |fill: u8, len: usize| ChunkRecord {
             compression: Compression::None,
@@ -1050,7 +1124,6 @@ mod tests {
         // The next region's chunk.
         assert!(header.read_chunk(ChunkPos::new(0, 64)).is_err());
         assert!(RegionHeader::read(dir.join("r.5.5.mca")).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A chunk's `.mcc` stays while the header on the disk names its stub:
@@ -1058,8 +1131,7 @@ mod tests {
     /// oversized again in one batch it is the new one and stays.
     #[test]
     fn an_mcc_goes_only_once_the_synced_header_stops_naming_it() {
-        let dir = std::env::temp_dir().join(format!("horizon-region-mcc-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_folder();
         let path = dir.join("r.0.0.mca");
         let (chunk, mcc) = (ChunkPos::new(3, 4), dir.join("c.3.4.mcc"));
         let record = |fill: u8, len: usize| ChunkRecord {
@@ -1093,15 +1165,13 @@ mod tests {
         assert!(mcc.exists());
         assert_eq!(read().compressed, big.compressed);
         drop(region);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `flush` (a cache's commit) puts the header in the file for another
     /// handle without a sync, and frees the old sectors at once.
     #[test]
     fn a_flushed_write_is_in_the_file_and_frees_its_old_sectors() {
-        let dir = std::env::temp_dir().join(format!("horizon-region-flush-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_folder();
         let path = dir.join("r.0.0.mca");
         let record = |fill: u8| ChunkRecord {
             compression: Compression::None,
@@ -1130,7 +1200,6 @@ mod tests {
             2
         );
         drop(region);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A disk with a volatile write cache, for power cuts. What was synced
@@ -1175,6 +1244,8 @@ mod tests {
             image: Option<(Vec<u8>, Externals)>,
             /// The folder of the region's `.mcc` files.
             folder: Option<PathBuf>,
+            /// The operation that fails instead of taking place, once.
+            pub(crate) fail: Option<usize>,
         }
         impl Drive {
             pub(crate) fn new(cut: Option<(usize, u64)>, folder: PathBuf) -> Self {
@@ -1192,13 +1263,23 @@ mod tests {
                     ..Self::default()
                 }
             }
-            fn before_op(&mut self) {
+            fn before_op(&mut self) -> io::Result<()> {
                 if let Some((at, seed)) = self.cut
                     && at == self.ops
                 {
                     self.image = Some((self.crash(seed), self.externals()));
                 }
                 self.ops += 1;
+                if self.fail == Some(self.ops - 1) {
+                    self.fail = None;
+                    return Err(io::Error::other("injected fault"));
+                }
+                Ok(())
+            }
+            /// The bytes as the program reads them: what a power cut leaves
+            /// when every write since the last sync reached the disk.
+            pub(crate) fn cached(&self) -> Vec<u8> {
+                self.cache.clone()
             }
             /// What a power cut now leaves on the disk.
             pub(crate) fn crash(&self, seed: u64) -> Vec<u8> {
@@ -1265,7 +1346,7 @@ mod tests {
             }
             pub(crate) fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
                 let mut drive = self.drive.borrow_mut();
-                drive.before_op();
+                drive.before_op()?;
                 let (start, end) = (self.at as usize, self.at as usize + buf.len());
                 if drive.cache.len() < end {
                     drive.cache.resize(end, 0);
@@ -1293,7 +1374,7 @@ mod tests {
             }
             pub(crate) fn sync_data(&self) -> io::Result<()> {
                 let mut drive = self.drive.borrow_mut();
-                drive.before_op();
+                drive.before_op()?;
                 let drive = &mut *drive;
                 drive.durable.resize(drive.cache.len(), 0);
                 for (block, versions) in std::mem::take(&mut drive.versions) {
@@ -1325,18 +1406,36 @@ mod tests {
     }
 
     static FOLDERS: AtomicU32 = AtomicU32::new(0);
+    /// A folder a test made for itself, removed when the test is done with
+    /// it.
+    struct Scratch(PathBuf);
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
     /// A new, empty folder of its own for a test's region, so the `.mcc`
     /// files it writes and removes are never another test's or the working
-    /// directory's.
-    fn scratch_folder() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "horizon-region-sim-{}-{}",
-            std::process::id(),
-            FOLDERS.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// directory's. A name already taken is skipped, never cleared.
+    fn scratch_folder() -> Scratch {
+        loop {
+            let dir = std::env::temp_dir().join(format!(
+                "horizon-region-sim-{}-{}",
+                std::process::id(),
+                FOLDERS.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&dir) {
+                Ok(()) => return Scratch(dir),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("no scratch folder: {e}"),
+            }
+        }
     }
 
     /// A record that names its chunk and version in its first six bytes,
@@ -1464,7 +1563,7 @@ mod tests {
             "the old order is only modelled for inline chunks"
         );
         let folder = scratch_folder();
-        let drive = Rc::new(RefCell::new(sim::Drive::new(cut, folder.clone())));
+        let drive = Rc::new(RefCell::new(sim::Drive::new(cut, folder.to_path_buf())));
         let disk = Disk::Sim(sim::Handle::new(drive.clone()));
         let mut region = RegionFile::from_file(folder.join("r.0.0.mca"), disk).unwrap();
         let mut rng = Rng(seed);
@@ -1531,7 +1630,6 @@ mod tests {
         }
         drop(region);
         let image = drive.borrow_mut().take_image(cut.map_or(seed, |c| c.1));
-        let _ = fs::remove_dir_all(&folder);
         (batches, image)
     }
 
@@ -1575,7 +1673,6 @@ mod tests {
             }
         }
         drop(region);
-        let _ = fs::remove_dir_all(&folder);
         (lost, wrong)
     }
 
@@ -1644,7 +1741,7 @@ mod tests {
             let folder = scratch_folder();
             let drive = Rc::new(RefCell::new(sim::Drive::new(
                 cut.map(|c| (c, 7)),
-                folder.clone(),
+                folder.to_path_buf(),
             )));
             let disk = Disk::Sim(sim::Handle::new(drive.clone()));
             let mut region = RegionFile::from_file(folder.join("r.0.0.mca"), disk).unwrap();
@@ -1674,7 +1771,6 @@ mod tests {
             };
             drop(region);
             let image = drive.borrow_mut().take_image(7);
-            let _ = fs::remove_dir_all(&folder);
             (vec![first, second], image, cleared)
         };
         let (batches, end, cleared) = run(None);
@@ -1696,7 +1792,7 @@ mod tests {
         let read = region.read(position(region.position, 0)).unwrap();
         assert_eq!(read.as_ref().and_then(untag_record), Some((0, 1)));
         drop(region);
-        let _ = fs::remove_dir_all(&folder);
+        drop(folder);
         assert_eq!(after_the_cut(&batches, image, before_clear), (0, 0));
     }
 
@@ -1743,7 +1839,6 @@ mod tests {
         drop(region);
         let mut reader = RegionFile::open(&path).unwrap();
         assert_eq!(read(&mut reader), (Compression::None, Some((5, 2))));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A `.mcc` that can't be removed after the header stopped naming it
@@ -1785,7 +1880,6 @@ mod tests {
             );
         }
         drop(region);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A region file this handle creates has its folder synced at the first
@@ -1820,6 +1914,121 @@ mod tests {
                 .unwrap()
                 .name_unsynced
         );
-        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A region on a simulated drive in its own folder, and the drive.
+    fn sim_region(folder: &Path) -> (RegionFile, Rc<RefCell<sim::Drive>>) {
+        let drive = Rc::new(RefCell::new(sim::Drive::new(None, folder.to_path_buf())));
+        let disk = Disk::Sim(sim::Handle::new(drive.clone()));
+        let region = RegionFile::from_file(folder.join("r.0.0.mca"), disk).unwrap();
+        (region, drive)
+    }
+    /// What a reader finds in `folder` if every write so far reached the
+    /// disk: the chunk of slot 0's tag.
+    fn read_cached(folder: &Path, drive: &RefCell<sim::Drive>) -> Option<(usize, u32)> {
+        let bytes = drive.borrow().cached();
+        let disk = Disk::Sim(sim::Handle::new(Rc::new(RefCell::new(sim::Drive::synced(
+            bytes,
+        )))));
+        let mut reader = RegionFile::from_file(folder.join("r.0.0.mca"), disk).unwrap();
+        let record = reader.read(position(reader.position, 0)).unwrap();
+        record.as_ref().and_then(untag_record)
+    }
+    /// Slot 0's chunk: inline, or oversized in `codec`.
+    fn slot_0(codec: Compression, version: u32, oversized: bool) -> ChunkRecord {
+        let len = if oversized { 256 * SECTOR + 100 } else { 100 };
+        ChunkRecord {
+            compression: codec,
+            compressed: codec.encode(&tagged(0, version, len)).unwrap(),
+            timestamp: version,
+        }
+    }
+
+    /// A sync whose header reached the file but whose own sync failed: the
+    /// file may hold that header, which names a stub in another codec than
+    /// the one synced before. The next write finishes that commit first,
+    /// so its `.mcc` is in the codec of the stub the file names.
+    #[test]
+    fn a_write_after_a_failed_header_sync_matches_the_header_it_left() {
+        let folder = scratch_folder();
+        let (mut region, drive) = sim_region(&folder);
+        let chunk = position(region.position, 0);
+        region
+            .write(chunk, &slot_0(Compression::None, 1, false))
+            .unwrap();
+        region.sync().unwrap();
+        region
+            .write(chunk, &slot_0(Compression::None, 2, true))
+            .unwrap();
+        // The sync: the sectors' sync, the header write, then the header's
+        // sync, which fails.
+        let ops = drive.borrow().ops;
+        drive.borrow_mut().fail = Some(ops + 2);
+        assert!(region.sync().is_err());
+        assert_eq!(read_cached(&folder, &drive), Some((0, 2)));
+        region
+            .write(chunk, &slot_0(Compression::Zlib, 3, true))
+            .unwrap();
+        assert_eq!(read_cached(&folder, &drive), Some((0, 3)));
+        region.sync().unwrap();
+        assert_eq!(read_cached(&folder, &drive), Some((0, 3)));
+    }
+
+    /// An oversized write whose stub can't be written leaves the chunk's
+    /// `.mcc` as it was, still matched to the stub the handle names.
+    #[test]
+    fn a_failed_stub_write_keeps_the_mcc_it_had() {
+        let folder = scratch_folder();
+        let (mut region, drive) = sim_region(&folder);
+        let chunk = position(region.position, 0);
+        region
+            .write(chunk, &slot_0(Compression::None, 1, false))
+            .unwrap();
+        region.sync().unwrap();
+        region
+            .write(chunk, &slot_0(Compression::None, 2, true))
+            .unwrap();
+        // The next drive operation is the new stub's write.
+        let ops = drive.borrow().ops;
+        drive.borrow_mut().fail = Some(ops);
+        assert!(
+            region
+                .write(chunk, &slot_0(Compression::Zlib, 3, true))
+                .is_err()
+        );
+        let read = region.read(chunk).unwrap();
+        assert_eq!(read.as_ref().and_then(untag_record), Some((0, 2)));
+        region.sync().unwrap();
+        assert_eq!(read_cached(&folder, &drive), Some((0, 2)));
+    }
+
+    /// A region created in folders that are not there yet: the handle makes
+    /// them, and its first `sync` syncs the parent of each, outermost first,
+    /// then the file's own folder. The next sync syncs no folder.
+    #[test]
+    fn a_region_in_new_folders_syncs_their_names_at_the_first_sync() {
+        let dir = scratch_folder();
+        let (dimensions, sky) = (dir.join("dimensions"), dir.join("dimensions/sky"));
+        let folder = sky.join("region");
+        let mut region = RegionFile::open_writable(folder.join("r.0.0.mca"), true).unwrap();
+        assert_eq!(
+            region.new_folders,
+            [dimensions.clone(), sky.clone(), folder.clone()]
+        );
+        region
+            .write(ChunkPos::new(0, 0), &slot_0(Compression::None, 1, false))
+            .unwrap();
+        crate::fs_sync::SYNCED.with(|s| s.borrow_mut().clear());
+        region.sync().unwrap();
+        assert_eq!(
+            crate::fs_sync::SYNCED.with(|s| s.take()),
+            [dir.to_path_buf(), dimensions, sky, folder]
+        );
+        assert!(region.new_folders.is_empty());
+        region
+            .write(ChunkPos::new(1, 0), &slot_0(Compression::None, 2, false))
+            .unwrap();
+        region.sync().unwrap();
+        assert!(crate::fs_sync::SYNCED.with(|s| s.take()).is_empty());
     }
 }
