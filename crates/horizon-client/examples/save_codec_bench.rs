@@ -35,11 +35,49 @@ use horizon_core::{
     paletted::PalettedContainer,
 };
 use horizon_world::{
-    DATA_VERSION, compression::Compression, region::RegionFile, registry::BlockRegistry,
+    DATA_VERSION,
+    compression::Compression,
+    region::{RegionFile, position_from_path},
+    registry::BlockRegistry,
 };
-use std::{hint::black_box, io::Write, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    hint::black_box,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
 type Error = Box<dyn std::error::Error>;
+
+/// A folder this run made under `parent`, removed with everything in it
+/// when dropped. A name already taken is skipped, never cleared, and
+/// `parent` itself is never removed.
+struct Scratch(PathBuf);
+impl Scratch {
+    fn new(parent: &Path, name: &str) -> std::io::Result<Self> {
+        let mut n = 0u32;
+        loop {
+            let dir = parent.join(format!("{name}-{}-{n}", std::process::id()));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return Ok(Self(dir)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 const STATES: &str = "air stone deepslate dirt grass_block water sand gravel bedrock granite diorite \
     andesite tuff coal_ore iron_ore copper_ore deepslate_iron_ore deepslate_diamond_ore lava cave_air";
@@ -151,7 +189,7 @@ fn fixture() -> Result<(&'static BlockRegistry, Arc<Biomes>), Error> {
             ),
         ),
     ]))?;
-    let temp = std::env::temp_dir().join(format!("horizon-save-biomes-{}", std::process::id()));
+    let temp = Scratch::new(&std::env::temp_dir(), "horizon-save-biomes")?;
     let textures = temp.join("assets/minecraft/textures/colormap");
     let biomes = temp.join("data/minecraft/worldgen/biome");
     std::fs::create_dir_all(&textures)?;
@@ -169,9 +207,9 @@ fn fixture() -> Result<(&'static BlockRegistry, Arc<Biomes>), Error> {
         std::fs::write(biomes.join(format!("{name}.json")), b"{}")?;
     }
     let loaded = Biomes::load(&horizon_assets::resource_source::ResourceRoot::directory(
-        temp.clone(),
+        temp.to_path_buf(),
     ));
-    std::fs::remove_dir_all(&temp)?;
+    drop(temp);
     Ok((Box::leak(Box::new(registry)), Arc::new(loaded?)))
 }
 
@@ -300,9 +338,10 @@ fn main() -> Result<(), Error> {
             return Err(format!("{name} must be at least 1").into());
         }
     }
-    let scratch: PathBuf = flag(&args, "--scratch")
-        .unwrap_or_else(std::env::temp_dir)
-        .join(format!("horizon-save-codec-{}", std::process::id()));
+    let scratch = Scratch::new(
+        &flag::<PathBuf>(&args, "--scratch").unwrap_or_else(std::env::temp_dir),
+        "horizon-save-codec",
+    )?;
     let (registry, biomes) = fixture()?;
     let limits = Limits::default();
     let encode = |c: &Chunk| save::encode_with(c, registry, &biomes, None, LevelShape::OVERWORLD);
@@ -317,10 +356,15 @@ fn main() -> Result<(), Error> {
         if let Some(world) = flag::<PathBuf>(&args, "--world") {
             // Region files in name order, so the same world gives the same
             // sample whatever order the folder lists them in; reading stops
-            // at `--chunks` records.
-            let mut paths = std::fs::read_dir(world.join("region"))?
-                .map(|entry| Ok(entry?.path()))
-                .collect::<std::io::Result<Vec<PathBuf>>>()?;
+            // at `--chunks` records. Only `r.X.Z.mca` files: the `.mcc`
+            // files of oversized chunks are read through their region.
+            let mut paths = Vec::new();
+            for entry in std::fs::read_dir(world.join("region"))? {
+                let path = entry?.path();
+                if path.is_file() && position_from_path(&path).is_ok() {
+                    paths.push(path);
+                }
+            }
             paths.sort();
             let mut records = Vec::new();
             'regions: for path in paths {
@@ -560,5 +604,6 @@ fn main() -> Result<(), Error> {
         println!("| {name} | {} |", spread(&mut samples));
     }
     println!("| region bytes on disk per chunk | {disk:.0} |");
-    Ok(std::fs::remove_dir_all(&scratch)?)
+    drop(scratch);
+    Ok(())
 }

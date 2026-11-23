@@ -45,6 +45,34 @@ use std::{
 
 const SECTOR: usize = 512;
 
+/// A folder this run made in the temp folder, removed with everything in it
+/// when dropped. A name already taken is skipped, never cleared.
+struct Scratch(PathBuf);
+impl Scratch {
+    fn new(name: &str) -> io::Result<Self> {
+        let mut n = 0u32;
+        loop {
+            let dir = std::env::temp_dir().join(format!("{name}-{}-{n}", std::process::id()));
+            match fs::create_dir(&dir) {
+                Ok(()) => return Ok(Self(dir)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// splitmix64: a seeded, portable random stream for the workload and the cuts.
 struct Rng(u64);
 impl Rng {
@@ -375,10 +403,10 @@ fn main() -> io::Result<()> {
         flag(&args, "--rounds", 12) as usize,
     );
     check_bounds(chunks)?;
-    let root = std::env::temp_dir().join(format!("horizon-power-cut-{}", std::process::id()));
+    let root = Scratch::new("horizon-power-cut")?;
     let (work, scratch) = (root.join("work"), root.join("crashed"));
-    fs::create_dir_all(&work)?;
-    fs::create_dir_all(&scratch)?;
+    fs::create_dir(&work)?;
+    fs::create_dir(&scratch)?;
     let sync_folder = args.iter().any(|a| a == "--sync-folder");
     let recorder = workload(&work, seed, (chunks, batch, rounds), sync_folder)?;
     let calls = recorder.events.len();
@@ -405,20 +433,18 @@ fn main() -> io::Result<()> {
             total.lost, total.wrong_key
         );
     }
-    fs::remove_dir_all(&root)
+    drop(root);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn run(seed: u64) -> (Recorder, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "horizon-power-cut-test-{}-{seed}",
-            std::process::id()
-        ));
-        fs::create_dir_all(dir.join("work")).unwrap();
-        fs::create_dir_all(dir.join("crashed")).unwrap();
+    fn run(seed: u64) -> (Recorder, Scratch) {
+        let dir = Scratch::new(&format!("horizon-power-cut-test-{seed}")).unwrap();
+        fs::create_dir(dir.join("work")).unwrap();
+        fs::create_dir(dir.join("crashed")).unwrap();
         let recorder = workload(&dir.join("work"), seed, (32, 8, 4), seed % 2 == 0).unwrap();
         (recorder, dir)
     }
@@ -433,7 +459,6 @@ mod tests {
             let outcome = check(&recorder, &images, &acknowledged, &dir.join("crashed")).unwrap();
             assert_eq!(outcome, Outcome::default());
         }
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -444,7 +469,6 @@ mod tests {
             let outcome = check(&recorder, &images, &acknowledged, &dir.join("crashed")).unwrap();
             assert_eq!(outcome, Outcome::default(), "cut after {cut} calls");
         }
-        fs::remove_dir_all(dir).unwrap();
     }
 
     /// A record whose identity fields survive but one interior 512-byte
@@ -480,7 +504,6 @@ mod tests {
                 wrong_key: 0
             }
         );
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -514,6 +537,5 @@ mod tests {
             })
             .collect();
         assert_eq!(outcomes[0], outcomes[1]);
-        fs::remove_dir_all(dir).unwrap();
     }
 }
