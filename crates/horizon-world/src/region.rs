@@ -164,13 +164,17 @@ pub struct RegionFile {
 /// closed and opened again before its first sync still has its name synced.
 static NEW_NAMES: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
 
-/// The region files whose handle was closed while a `sync` that wrote a
-/// new header had not made it durable, its retry in `Drop` failing too: the
-/// file may hold a header that is not on the disk. The next handle on the
-/// file finishes that commit before its first write or clear allocates or
-/// changes anything, as the closed one would have.
-static UNCOMMITTED: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
-fn uncommitted() -> std::sync::MutexGuard<'static, BTreeSet<PathBuf>> {
+/// The header (offsets, timestamps) a `sync` was committing when its handle
+/// was closed with it not made durable, the retry in `Drop` failing too, by
+/// region file: the file may hold that header not on the disk, or part of
+/// it if the header write itself failed. The next handle on the file takes
+/// this header, not the one it reads, and commits it before its first write
+/// or clear allocates or changes anything, as the closed one would have.
+/// A new file made at the path drops it.
+type Header = Box<([u32; 1024], [u32; 1024])>;
+static UNCOMMITTED: std::sync::Mutex<std::collections::BTreeMap<PathBuf, Header>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+fn uncommitted() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<PathBuf, Header>> {
     UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -391,6 +395,8 @@ impl RegionFile {
             match options.clone().create_new(true).open(&path) {
                 Ok(file) => {
                     names.insert(path.clone());
+                    // Not the file a closed handle left a header for.
+                    uncommitted().remove(&path);
                     file
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => options.open(&path)?,
@@ -424,10 +430,14 @@ impl RegionFile {
             pending_removals: Vec::new(),
         };
         region.mark_used();
-        if uncommitted().contains(&region.path) {
-            // A commit a closed handle left unfinished: the header read
-            // from the file is staged again, and the next write or clear
-            // syncs it before it allocates a sector.
+        let left = uncommitted().get(&region.path).cloned();
+        if let Some(header) = left {
+            // A commit a closed handle left unfinished: its whole header is
+            // staged in place of the one read, which may be torn, and the
+            // next write or clear writes and syncs it before it allocates
+            // a sector.
+            (region.offsets, region.timestamps) = *header;
+            region.mark_used();
             region.header_staged = true;
             region.commit_unfinished = Some(Commit::Sync);
             region.inherited_commit = true;
@@ -941,7 +951,7 @@ impl Drop for RegionFile {
     fn drop(&mut self) {
         if self.header_staged {
             if self.sync().is_err() && matches!(self.commit_unfinished, Some(Commit::Sync)) {
-                uncommitted().insert(self.path.clone());
+                uncommitted().insert(self.path.clone(), Box::new((self.offsets, self.timestamps)));
             }
         } else if !self.pending_removals.is_empty() {
             let _ = self.remove_unused_externals();
@@ -1364,6 +1374,9 @@ mod tests {
             folder: Option<PathBuf>,
             /// The operation that fails instead of taking place, once.
             pub(crate) fail: Option<usize>,
+            /// The write that stores only its first `.1` bytes and then
+            /// fails, once.
+            pub(crate) tear: Option<(usize, usize)>,
         }
         impl Drive {
             pub(crate) fn new(cut: Option<(usize, u64)>, folder: PathBuf) -> Self {
@@ -1469,7 +1482,17 @@ mod tests {
             }
             pub(crate) fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
                 let mut drive = self.drive.borrow_mut();
+                let tear = drive.tear.filter(|t| t.0 == drive.ops).map(|t| t.1);
                 drive.before_op()?;
+                let buf = match tear {
+                    Some(kept) => {
+                        drive.tear = None;
+                        drop(drive);
+                        self.write(&buf[..kept])?;
+                        return Err(io::Error::other("injected torn write"));
+                    }
+                    None => buf,
+                };
                 let (start, end) = (self.at as usize, self.at as usize + buf.len());
                 if drive.cache.len() < end {
                     drive.cache.resize(end, 0);
@@ -2071,12 +2094,25 @@ mod tests {
     /// The chunk of slot 0's tag in the region file `bytes`, with the
     /// `.mcc` files of `folder`.
     fn read_image(folder: &Path, bytes: Vec<u8>) -> Option<(usize, u32)> {
+        read_image_slots(folder, bytes, 1)[0].0
+    }
+    /// The tags of the chunks of the first `slots` slots in the region file
+    /// `bytes`, and the timestamp its header gives each.
+    fn read_image_slots(
+        folder: &Path,
+        bytes: Vec<u8>,
+        slots: usize,
+    ) -> Vec<(Option<(usize, u32)>, u32)> {
         let disk = Disk::Sim(sim::Handle::new(Rc::new(RefCell::new(sim::Drive::synced(
             bytes,
         )))));
         let mut reader = RegionFile::from_file(folder.join("r.0.0.mca"), disk).unwrap();
-        let record = reader.read(position(reader.position, 0)).unwrap();
-        record.as_ref().and_then(untag_record)
+        (0..slots)
+            .map(|s| {
+                let record = reader.read(position(reader.position, s)).unwrap();
+                (record.as_ref().and_then(untag_record), reader.timestamps[s])
+            })
+            .collect()
     }
     /// Slot 0's chunk: inline, or oversized in `codec`.
     fn slot_0(codec: Compression, version: u32, oversized: bool) -> ChunkRecord {
@@ -2314,6 +2350,52 @@ mod tests {
         // the one the closed handle wrote.
         assert_eq!(read_image(&folder, image), Some((0, 2)));
         region.sync().unwrap();
-        assert!(!uncommitted().contains(&folder.join("r.0.0.mca")));
+        assert!(!uncommitted().contains_key(&folder.join("r.0.0.mca")));
+    }
+
+    /// A handle closed after its header write failed partway, the retry in
+    /// `Drop` failing too: the file holds a torn header, one chunk's new
+    /// entry and the other's old one. The next handle on the file commits
+    /// the whole header the closed one meant, not the torn one it reads.
+    #[test]
+    fn a_region_reopened_after_a_torn_header_write_commits_the_whole_header() {
+        let folder = scratch_folder();
+        let (mut region, drive) = sim_region(&folder);
+        let record = |s, v| ChunkRecord {
+            compression: Compression::None,
+            compressed: tagged(s, v, 100),
+            timestamp: v,
+        };
+        for s in 0..2 {
+            region
+                .write(position(region.position, s), &record(s, 1))
+                .unwrap();
+        }
+        region.sync().unwrap();
+        for s in 0..2 {
+            region
+                .write(position(region.position, s), &record(s, 2))
+                .unwrap();
+        }
+        // The sectors' sync, then the header write: only slot 0's entry
+        // reaches the file. Then the retry in `Drop`: its header write fails.
+        let ops = drive.borrow().ops;
+        drive.borrow_mut().tear = Some((ops + 1, 4));
+        assert!(region.sync().is_err());
+        let ops = drive.borrow().ops;
+        drive.borrow_mut().fail = Some(ops);
+        drop(region);
+        let disk = Disk::Sim(sim::Handle::new(drive.clone()));
+        let mut region = RegionFile::from_file(folder.join("r.0.0.mca"), disk).unwrap();
+        region
+            .write(position(region.position, 2), &record(2, 3))
+            .unwrap();
+        region.sync().unwrap();
+        let synced = drive.borrow().synced_bytes();
+        // Each chunk's new version, under its own timestamp.
+        assert_eq!(
+            read_image_slots(&folder, synced, 3),
+            [(Some((0, 2)), 2), (Some((1, 2)), 2), (Some((2, 3)), 3)]
+        );
     }
 }
