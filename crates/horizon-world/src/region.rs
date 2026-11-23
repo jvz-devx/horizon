@@ -330,10 +330,13 @@ fn create_folders(folder: &Path) -> io::Result<()> {
             None => break,
         }
     }
+    // Held from each folder's creation to its entry in the list, so a
+    // sibling region that opens a file in it and syncs finds the entry.
+    let mut pending = new_folders();
     for folder in missing.into_iter().rev() {
         match fs::create_dir(&folder) {
             Ok(()) => {
-                new_folders().insert(folder);
+                pending.insert(folder);
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists && folder.is_dir() => {}
             Err(e) => return Err(e),
