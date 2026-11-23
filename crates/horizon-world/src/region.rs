@@ -144,6 +144,9 @@ pub struct RegionFile {
     /// finish it first, the way it was started, so `durable` names what
     /// the file holds before a `.mcc` is matched to it.
     commit_unfinished: Option<Commit>,
+    /// Whether this handle took over an unfinished commit from a handle
+    /// closed before it ([`UNCOMMITTED`]).
+    inherited_commit: bool,
     /// The sectors of the chunks written or cleared since the last `sync`
     /// (start, count). The header in the file may still point to them, so
     /// they are freed only once the new header is on the disk.
@@ -160,6 +163,22 @@ pub struct RegionFile {
 /// one to sync syncs its name, whichever handle created it, and a file
 /// closed and opened again before its first sync still has its name synced.
 static NEW_NAMES: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
+
+/// The last committed header (offsets, timestamps) of each region file
+/// whose handle was closed while a `sync` that wrote a new header had not
+/// made it durable, its retry in `Drop` failing too: the file may hold a
+/// header that is not on the disk. The next handle on the file keeps the
+/// sectors that committed header names and finishes the commit before it
+/// writes, as the closed one would have.
+static UNCOMMITTED: std::sync::Mutex<
+    std::collections::BTreeMap<PathBuf, Box<([u32; 1024], [u32; 1024])>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+fn uncommitted() -> std::sync::MutexGuard<
+    'static,
+    std::collections::BTreeMap<PathBuf, Box<([u32; 1024], [u32; 1024])>>,
+> {
+    UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// How a header write was started: by `sync` or by `flush`.
 #[derive(Clone, Copy)]
@@ -406,11 +425,35 @@ impl RegionFile {
             durable: offsets,
             durable_timestamps: timestamps,
             commit_unfinished: None,
+            inherited_commit: false,
             pending_free: Vec::new(),
             pending_removals: Vec::new(),
         };
         region.mark_used();
+        let inherited = uncommitted().get(&region.path).cloned();
+        if let Some(committed) = inherited {
+            region.inherit_commit(*committed);
+        }
         Ok(region)
+    }
+
+    /// A commit a closed handle left unfinished ([`UNCOMMITTED`]): the
+    /// header read from the file is staged again, the sectors of the
+    /// committed header stay taken until it is on the disk, and the next
+    /// write or clear finishes it first.
+    fn inherit_commit(&mut self, (offsets, timestamps): ([u32; 1024], [u32; 1024])) {
+        self.durable = offsets;
+        self.durable_timestamps = timestamps;
+        for (i, &offset) in offsets.iter().enumerate() {
+            if offset != 0 && offset != self.offsets[i] {
+                let (start, count) = ((offset >> 8) as usize, (offset & 255) as usize);
+                self.force(start, count);
+                self.pending_free.push((start, count));
+            }
+        }
+        self.header_staged = true;
+        self.commit_unfinished = Some(Commit::Sync);
+        self.inherited_commit = true;
     }
 
     /// The sectors in use as `offsets` places them, and the header's two.
@@ -772,6 +815,9 @@ impl RegionFile {
 
     /// The header in memory is the file's now: the old sectors are free.
     fn header_written(&mut self) {
+        if std::mem::take(&mut self.inherited_commit) {
+            uncommitted().remove(&self.path);
+        }
         self.commit_unfinished = None;
         self.header_staged = false;
         self.durable = self.offsets;
@@ -910,10 +956,17 @@ impl Drop for RegionFile {
     /// A handle closed with writes not yet synced makes them durable as
     /// `sync` does, so the file's header names them for the next reader;
     /// one with only `.mcc` removals left over retries them. An error here
-    /// has no caller to go to; a writer that must know syncs.
+    /// has no caller to go to; a writer that must know syncs. A header
+    /// written but not made durable is left to the next handle on the file
+    /// ([`UNCOMMITTED`]).
     fn drop(&mut self) {
         if self.header_staged {
-            let _ = self.sync();
+            if self.sync().is_err() && matches!(self.commit_unfinished, Some(Commit::Sync)) {
+                uncommitted().insert(
+                    self.path.clone(),
+                    Box::new((self.durable, self.durable_timestamps)),
+                );
+            }
         } else if !self.pending_removals.is_empty() {
             let _ = self.remove_unused_externals();
         }
@@ -2236,5 +2289,55 @@ mod tests {
             .unwrap();
         region.sync().unwrap();
         assert_eq!(synced(), Some((0, 3)));
+    }
+
+    /// A handle closed after its header commit failed, the retry in `Drop`
+    /// failing too: the file holds a header that is not on the disk. The
+    /// next handle on the file keeps the sectors the header on the disk
+    /// names and finishes the commit before it writes, so it never writes
+    /// over a chunk that header names.
+    #[test]
+    fn a_region_reopened_after_a_failed_commit_finishes_it_before_writing() {
+        let folder = scratch_folder();
+        let (mut region, drive) = sim_region(&folder);
+        let first = position(region.position, 0);
+        region
+            .write(first, &slot_0(Compression::None, 1, false))
+            .unwrap();
+        region.sync().unwrap();
+        region
+            .write(first, &slot_0(Compression::None, 2, false))
+            .unwrap();
+        // The sectors' sync, the header write, then the header's sync,
+        // which fails; then the retry in `Drop`: the header write and its
+        // sync, which fails too.
+        let ops = drive.borrow().ops;
+        drive.borrow_mut().fail = Some(ops + 2);
+        assert!(region.sync().is_err());
+        let ops = drive.borrow().ops;
+        drive.borrow_mut().fail = Some(ops + 1);
+        drop(region);
+        let disk = Disk::Sim(sim::Handle::new(drive.clone()));
+        let mut region = RegionFile::from_file(folder.join("r.0.0.mca"), disk).unwrap();
+        assert!(region.has_staged_changes());
+        // A chunk of the same size in another slot: the first free sectors
+        // must not be the ones the header on the disk names for slot 0.
+        let record = ChunkRecord {
+            compression: Compression::None,
+            compressed: tagged(1, 3, 100),
+            timestamp: 3,
+        };
+        region.write(position(region.position, 1), &record).unwrap();
+        // The header on the disk with every sector written since.
+        let image = {
+            let drive = drive.borrow();
+            let mut bytes = drive.cached();
+            bytes[..HEADER].copy_from_slice(&drive.synced_bytes()[..HEADER]);
+            bytes
+        };
+        let read = read_image(&folder, image);
+        assert!(matches!(read, Some((0, 1 | 2))), "{read:?}");
+        region.sync().unwrap();
+        assert!(!uncommitted().contains_key(&folder.join("r.0.0.mca")));
     }
 }
