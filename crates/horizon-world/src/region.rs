@@ -137,6 +137,8 @@ pub struct RegionFile {
     /// The chunk places of the header last written to the file: what a
     /// reader after a power cut finds, while `offsets` has changes staged.
     durable: [u32; 1024],
+    /// That header's timestamps.
+    durable_timestamps: [u32; 1024],
     /// A header write that failed after it started, or whose sync failed:
     /// the file may hold that header or the one before. `write` and `clear`
     /// finish it first, the way it was started, so `durable` names what
@@ -402,6 +404,7 @@ impl RegionFile {
             sectors_written: false,
             externals_written: false,
             durable: offsets,
+            durable_timestamps: timestamps,
             commit_unfinished: None,
             pending_free: Vec::new(),
             pending_removals: Vec::new(),
@@ -655,7 +658,7 @@ impl RegionFile {
                 // dropped after this failure as on the disk, and the header
                 // would then name sectors that are not there.
                 if self.commit_unfinished.is_none() {
-                    self.discard_staged()?;
+                    self.discard_staged();
                 }
                 return Err(e);
             }
@@ -670,32 +673,30 @@ impl RegionFile {
     }
 
     /// The writes and clears since the last commit dropped, after their
-    /// sectors could not be synced: the header in memory is the file's
-    /// again (no header was written since that commit), the sectors they
-    /// took are free, and only the `.mcc` files that header doesn't name
-    /// stay queued for removal. The caller still has the chunks and writes
+    /// sectors could not be synced: the header in memory is the last one
+    /// written to the file again (kept in memory, so this can't fail
+    /// halfway), the sectors they took are free, and only the `.mcc` files
+    /// that header doesn't name stay queued for removal (one whose stub
+    /// can't be read stays). The caller still has the chunks and writes
     /// them again.
-    fn discard_staged(&mut self) -> io::Result<()> {
+    fn discard_staged(&mut self) {
         let staged = self.offsets;
-        let (offsets, timestamps) = read_header(&mut self.file)?;
-        self.offsets = offsets;
-        self.timestamps = timestamps;
-        self.durable = offsets;
+        self.offsets = self.durable;
+        self.timestamps = self.durable_timestamps;
         self.mark_used();
         self.pending_free.clear();
         self.header_staged = false;
         self.sectors_written = false;
         let mut slots = std::mem::take(&mut self.pending_removals);
         let changed: Vec<usize> = (0..1024)
-            .filter(|&i| staged[i] != offsets[i] && !slots.contains(&i))
+            .filter(|&i| staged[i] != self.durable[i] && !slots.contains(&i))
             .collect();
         slots.extend(changed);
         for i in slots {
-            if !self.stub_is_external(offsets[i])? {
+            if !self.stub_is_external(self.durable[i]).unwrap_or(true) {
                 self.pending_removals.push(i);
             }
         }
-        Ok(())
     }
 
     /// Whether writes or clears are staged that no `sync` or `flush` has
@@ -718,13 +719,17 @@ impl RegionFile {
     /// outermost first; and the file's folder, if a `.mcc` was renamed into
     /// it since it last was synced.
     fn sync_folder(&mut self) -> io::Result<()> {
-        // A path sorts after its ancestors, so outermost first; the file's
-        // own name is the last.
-        let unsynced: Vec<PathBuf> = new_names()
-            .iter()
-            .filter(|name| self.path.starts_with(name))
-            .cloned()
-            .collect();
+        // The file and its folders, outermost first: only these are looked
+        // up, however many names other regions left.
+        let mut unsynced: Vec<PathBuf> = {
+            let names = new_names();
+            self.path
+                .ancestors()
+                .filter(|a| names.contains(*a))
+                .map(Path::to_path_buf)
+                .collect()
+        };
+        unsynced.reverse();
         let named = unsynced.last() == Some(&self.path);
         for name in unsynced {
             crate::fs_sync::sync_dir(name.parent().unwrap_or(Path::new("")))?;
@@ -756,6 +761,7 @@ impl RegionFile {
         self.commit_unfinished = None;
         self.header_staged = false;
         self.durable = self.offsets;
+        self.durable_timestamps = self.timestamps;
         for (start, count) in std::mem::take(&mut self.pending_free) {
             self.free(start, count);
         }
@@ -2208,6 +2214,7 @@ mod tests {
         assert!(!region.has_staged_changes());
         let read = region.read(chunk).unwrap();
         assert_eq!(read.as_ref().and_then(untag_record), Some((0, 1)));
+        assert_eq!(region.chunks().collect::<Vec<_>>(), [(chunk, 1)]);
         region.sync().unwrap();
         assert_eq!(synced(), Some((0, 1)));
         region
