@@ -1502,11 +1502,10 @@ fn encode_with_palette_cache(
 pub fn encode_rest(
     chunk: &Chunk,
     registry: &BlockRegistry,
-    biomes: &Biomes,
+    _biomes: &Biomes,
     tables: Option<&SaveTables>,
     shape: LevelShape,
 ) -> NamedTag {
-    let _ = biomes;
     encode_root(chunk, Vec::new(), registry, tables, shape, false)
 }
 
@@ -1910,6 +1909,7 @@ fn decode_structure_refs(tag: &Tag, chunk: &mut Chunk) {
 }
 
 /// Decode the part [`encode_rest`] saves into a chunk whose sections are ready.
+/// To decode saved ticks as well, restore their lists to `root` first.
 pub fn decode_rest(
     root: &NamedTag,
     chunk: &mut Chunk,
@@ -2517,14 +2517,14 @@ pub struct BackendContext<'a> {
 pub enum BackendRecord<'a> {
     /// A full chunk and the old-world blending data captured when it was saved.
     Chunk(&'a Chunk, BackendContext<'a>, Option<&'a BlendingData>),
-    /// Any record that remains in vanilla NBT form.
+    /// A complete vanilla NBT record, including proto chunks and synchronous saves.
     Tag(&'a NamedTag),
     Delete,
 }
 
 /// A saved chunk returned by a [`Backend`].
 pub enum BackendChunk {
-    /// A full chunk, including its saved light.
+    /// A full chunk in the current version, including its saved light.
     Chunk(Box<Chunk>),
     /// A chunk record in vanilla NBT form.
     Tag(NamedTag),
@@ -2535,7 +2535,7 @@ pub enum BackendChunk {
 /// NBT data fixes. `carrier_store`, `horizon-server prune`, the world upgrader, and
 /// `intern_saved_fluids` still assume region files; PR 5 will route those paths.
 pub trait Backend: Send + Sync {
-    /// The saved chunk, or `None` when it is absent or held as NBT.
+    /// The saved chunk in native or complete NBT form, or `None` if absent.
     fn load_chunk(
         &self,
         x: i32,
@@ -3200,16 +3200,18 @@ impl SaveDir {
         };
         read_region_record(&self.root, cache, self.backend.as_deref(), folder, x, z)
             .inspect(|record| {
-                if self.trusted_fluid_load
-                    && folder == "region"
-                    && let Some(root) = record
-                {
-                    intern_saved_fluids(root);
+                if let Some(root) = record {
+                    self.intern_record_fluids(folder, root);
                 }
             })
             .map_err(|e| {
                 crate::chunk_io::report_load_failure(&self.root, x, z, &e);
             })
+    }
+    fn intern_record_fluids(&self, folder: &str, root: &NamedTag) {
+        if self.trusted_fluid_load && folder == "region" {
+            intern_saved_fluids(root);
+        }
     }
     /// A record brought to the current version (`upgrade_record`); `Err` when that failed.
     fn try_read_record(
@@ -3252,16 +3254,21 @@ impl SaveDir {
         registry: &BlockRegistry,
         biomes: &Biomes,
     ) -> std::result::Result<Option<Chunk>, ()> {
-        match self.backend_chunk(x, z, registry, biomes) {
-            Ok(Some(chunk)) => return Ok(Some(chunk)),
-            Ok(None) => {}
-            Err(e) => {
-                crate::chunk_io::report_load_failure(&self.root, x, z, &e);
-                return Err(());
+        let root = if let Some(backend) = &self.backend {
+            match self
+                .backend_chunk(backend.as_ref(), x, z, registry, biomes, false)
+                .map_err(|e| {
+                    crate::chunk_io::report_load_failure(&self.root, x, z, &e);
+                })? {
+                Some(BackendChunk::Chunk(chunk)) => return Ok(Some(*chunk)),
+                Some(BackendChunk::Tag(root)) => root,
+                None => return Ok(None),
             }
-        }
-        let Some(root) = self.try_read_record("region", x, z)? else {
-            return Ok(None);
+        } else {
+            let Some(root) = self.try_read_record("region", x, z)? else {
+                return Ok(None);
+            };
+            root
         };
         let tables = self.tables.get().map(|t| &**t);
         let Some(mut chunk) = decode_with(&root, registry, biomes, tables, self.shape.column())
@@ -3272,25 +3279,24 @@ impl SaveDir {
         chunk.entities = horizon_world::chunk::legacy_entities(&root.tag);
         Ok(Some(chunk))
     }
-    /// Load a chunk in the backend's own form. A queued write takes precedence and is read
-    /// through the pending NBT record instead.
+    /// Read a pending snapshot instead of consulting the backend if a write is queued.
     fn backend_chunk(
         &self,
+        backend: &dyn Backend,
         x: i32,
         z: i32,
         registry: &BlockRegistry,
         biomes: &Biomes,
-    ) -> Result<Option<Chunk>> {
-        let Some(backend) = &self.backend else {
-            return Ok(None);
-        };
-        if self
+        far: bool,
+    ) -> Result<Option<BackendChunk>> {
+        let pending = self
             .pending
             .lock()
             .map_err(|_| "pending writes poisoned")?
-            .contains_key(&(Folder::Region, x, z))
-        {
-            return Ok(None);
+            .get(&(Folder::Region, x, z))
+            .map(|(_, record)| record.clone());
+        if let Some(record) = pending {
+            return Ok(record.tag().map(|tag| BackendChunk::Tag((*tag).clone())));
         }
         let context = BackendContext {
             registry,
@@ -3298,10 +3304,29 @@ impl SaveDir {
             tables: self.tables.get().map(|tables| &**tables),
             shape: self.shape,
         };
-        Ok(match backend.load_chunk(x, z, &context)? {
-            Some(BackendChunk::Chunk(chunk)) => Some(*chunk),
-            Some(BackendChunk::Tag(_)) | None => None,
-        })
+        let mut chunk = backend.load_chunk(x, z, &context)?;
+        if let Some(BackendChunk::Tag(root)) = &mut chunk {
+            if !far {
+                self.intern_record_fluids("region", root);
+            }
+            self.upgrade_record(Folder::Region, root)?;
+        }
+        Ok(chunk)
+    }
+
+    fn far_chunk(
+        &self,
+        x: i32,
+        z: i32,
+        registry: &BlockRegistry,
+        biomes: &Biomes,
+    ) -> Option<BackendChunk> {
+        match &self.backend {
+            Some(backend) => self
+                .backend_chunk(backend.as_ref(), x, z, registry, biomes, true)
+                .ok()?,
+            None => self.far_record(x, z).map(BackendChunk::Tag),
+        }
     }
     /// A saved full chunk read for a player's far ring (`lan::far`), as `load` but past the gameplay
     /// region cache (`far_record`).
@@ -3312,10 +3337,10 @@ impl SaveDir {
         registry: &BlockRegistry,
         biomes: &Biomes,
     ) -> Option<Chunk> {
-        if let Ok(Some(chunk)) = self.backend_chunk(x, z, registry, biomes) {
-            return chunk.light_loaded.then_some(chunk);
-        }
-        let root = self.far_record(x, z)?;
+        let root = match self.far_chunk(x, z, registry, biomes)? {
+            BackendChunk::Chunk(chunk) => return chunk.light_loaded.then_some(*chunk),
+            BackendChunk::Tag(root) => root,
+        };
         let tables = self.tables.get().map(|t| &**t);
         let mut chunk = decode_with(&root, registry, biomes, tables, self.shape.column())?;
         load_light(&root.tag, &mut chunk, self.shape.sky_light);
@@ -5481,15 +5506,15 @@ impl SaveDir {
         assets: &crate::assets::Assets,
         biomes: &Biomes,
     ) -> Option<LodSurfaces> {
-        let root = match self.backend_chunk(x, z, assets.registry, biomes) {
-            Ok(Some(chunk)) => encode_with(
+        let root = match self.far_chunk(x, z, assets.registry, biomes)? {
+            BackendChunk::Chunk(chunk) => encode_with(
                 &chunk,
                 assets.registry,
                 biomes,
                 self.tables.get().map(|tables| &**tables),
                 self.shape,
             ),
-            _ => self.far_record(x, z)?,
+            BackendChunk::Tag(root) => root,
         };
         // Proto saves may still be missing decoration from their neighbors.
         if text(root.tag.get("Status"))

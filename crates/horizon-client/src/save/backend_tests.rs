@@ -1,8 +1,8 @@
 use super::*;
-use std::sync::{Barrier, OnceLock, atomic::AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 
 fn registry() -> &'static BlockRegistry {
-    static REGISTRY: OnceLock<&'static BlockRegistry> = OnceLock::new();
+    static REGISTRY: OnceLock<BlockRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| {
         let facts: &[u8] = br#"{
                 "defaults": {"minecraft:air": 0, "minecraft:bell": 1},
@@ -11,13 +11,12 @@ fn registry() -> &'static BlockRegistry {
                     ["minecraft:bell", false, false, "bell", "minecraft:bell"]
                 ]
             }"#;
-        let registry = BlockRegistry::from_facts_json(facts).unwrap();
-        Box::leak(Box::new(registry))
+        BlockRegistry::from_facts_json(facts).unwrap()
     })
 }
 
-fn biomes() -> &'static Biomes {
-    static BIOMES: OnceLock<&'static Biomes> = OnceLock::new();
+fn biomes() -> &'static Arc<Biomes> {
+    static BIOMES: OnceLock<Arc<Biomes>> = OnceLock::new();
     BIOMES.get_or_init(|| {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("data/minecraft/worldgen/biome");
@@ -29,7 +28,7 @@ fn biomes() -> &'static Biomes {
         .unwrap();
         let resources =
             horizon_assets::resource_source::ResourceRoot::directory(root.path().to_path_buf());
-        Box::leak(Box::new(Biomes::load_for_server(&resources).unwrap()))
+        Arc::new(Biomes::load_for_server(&resources).unwrap())
     })
 }
 
@@ -74,7 +73,6 @@ fn assert_same_chunk(left: &Chunk, right: &Chunk, shape: LevelShape) {
     }
 }
 
-/// Negative control: omitting the rest decode loses structure refs, block entities and ticks.
 #[test]
 fn rest_codec_reconstructs_the_non_section_chunk_data() {
     let registry = registry();
@@ -102,6 +100,12 @@ fn rest_codec_reconstructs_the_non_section_chunk_data() {
         kind: TickTypeId(1),
         pos: BlockPos::new(49, 70, -30),
         delay: 17,
+        priority: TickPriority::High,
+    });
+    extras.fluid_ticks.push(SavedTick {
+        kind: TickTypeId(fluid_id("minecraft:water").unwrap()),
+        pos: BlockPos::new(49, 70, -30),
+        delay: 21,
         priority: TickPriority::High,
     });
     chunk.saved = Some(Arc::new(extras));
@@ -142,14 +146,22 @@ fn rest_codec_reconstructs_the_non_section_chunk_data() {
     decode_rest(&rest, &mut restored, registry, Some(&tables));
     let expected = decode_with(&encoded, registry, biomes, Some(&tables), shape.column())
         .expect("full record decodes");
+    let saved = expected.saved.as_ref().unwrap();
+    assert_eq!(saved.block_entities.len(), 1);
+    assert_eq!(saved.block_ticks.len(), 1);
+    assert_eq!(saved.fluid_ticks.len(), 1);
     assert_same_chunk(&expected, &restored, shape);
 }
 
+type ChunkTags = HashMap<(i32, i32), NamedTag>;
+type WriteGate = (mpsc::Sender<()>, mpsc::Receiver<()>);
+
 #[derive(Default)]
 struct MemoryBackend {
-    records: Mutex<HashMap<String, HashMap<(i32, i32), NamedTag>>>,
+    records: Mutex<HashMap<String, ChunkTags>>,
     chunks: Mutex<HashMap<(i32, i32), Chunk>>,
-    next_write_gate: Mutex<Option<Arc<Barrier>>>,
+    chunk_tags: Mutex<ChunkTags>,
+    write_gate: Mutex<Option<WriteGate>>,
     region_chunk_queries: AtomicUsize,
 }
 
@@ -171,14 +183,14 @@ impl Backend for MemoryBackend {
         z: i32,
         _context: &BackendContext<'_>,
     ) -> Result<Option<BackendChunk>> {
-        Ok(self
-            .chunks
-            .lock()
-            .map_err(|_| "memory chunks poisoned")?
-            .get(&(x, z))
-            .cloned()
-            .map(Box::new)
-            .map(BackendChunk::Chunk))
+        let chunk = self.chunks.lock().unwrap().get(&(x, z)).cloned();
+        if let Some(chunk) = chunk {
+            return Ok(Some(BackendChunk::Chunk(Box::new(chunk))));
+        }
+        if let Some(tag) = self.chunk_tags.lock().unwrap().get(&(x, z)).cloned() {
+            return Ok(Some(BackendChunk::Tag(tag)));
+        }
+        Ok(self.read_tag("region", x, z)?.map(BackendChunk::Tag))
     }
 
     fn read_tag(&self, folder: &str, x: i32, z: i32) -> Result<Option<NamedTag>> {
@@ -192,9 +204,10 @@ impl Backend for MemoryBackend {
     }
 
     fn write(&self, folder: &str, records: &[((i32, i32), BackendRecord<'_>)]) -> Result<()> {
-        if let Some(gate) = self.next_write_gate.lock().unwrap().take() {
-            gate.wait();
-            gate.wait();
+        let gate = self.write_gate.lock().unwrap().take();
+        if let Some((started, release)) = gate {
+            started.send(())?;
+            release.recv_timeout(std::time::Duration::from_secs(5))?;
         }
         let mut tags = self.records.lock().map_err(|_| "memory records poisoned")?;
         let mut chunks = self.chunks.lock().map_err(|_| "memory chunks poisoned")?;
@@ -246,7 +259,6 @@ impl Backend for MemoryBackend {
     }
 }
 
-/// Negative control: bypassing `backend.write` leaves no stored records and breaks these checks.
 #[test]
 fn save_dir_routes_chunks_entities_and_poi_through_the_backend() {
     let root = tempfile::tempdir().unwrap();
@@ -281,34 +293,27 @@ fn save_dir_routes_chunks_entities_and_poi_through_the_backend() {
 
     let mut chunk = Chunk::empty(0, 0);
     chunk.set(1, 70, 2, 1);
+    chunk.set(2, 70, 2, 1);
     chunk
         .structure_refs
         .push(("minecraft:village".into(), (4, 5)));
-    let biomes = Arc::new(biomes().clone());
-    let gate = Arc::new(Barrier::new(2));
-    *backend.next_write_gate.lock().unwrap() = Some(gate.clone());
-    save.save_later(&[Arc::new(chunk.clone())], registry(), &biomes)
+    let biomes = biomes();
+    save.save_later(&[Arc::new(chunk.clone())], registry(), biomes)
         .unwrap();
-
-    gate.wait();
-    let queued = save
-        .load(0, 0, registry(), &biomes)
-        .expect("queued chunk loads");
-    gate.wait();
     save.flush().unwrap();
     let loaded = save
-        .load(0, 0, registry(), &biomes)
+        .load(0, 0, registry(), biomes)
         .expect("backend chunk loads");
-    assert_same_chunk(&queued, &chunk, LevelShape::OVERWORLD);
     assert_same_chunk(&loaded, &chunk, LevelShape::OVERWORLD);
+    assert!(backend.chunks.lock().unwrap().contains_key(&(0, 0)));
 
-    save.save_entities(vec![(
-        (0, 0),
-        vec![Tag::compound([("id", string("example:entity"))])],
-    )])
-    .unwrap();
-    assert!(backend.read_tag("entities", 0, 0).unwrap().is_some());
-    let poi = backend.read_tag("poi", 0, 0).unwrap().expect("POI saved");
+    let entities = vec![Tag::compound([("id", string("example:entity"))])];
+    save.save_entities(vec![((0, 0), entities.clone())])
+        .unwrap();
+    assert_eq!(save.load_entities(0, 0), entities);
+    save.save_entities(vec![((0, 0), Vec::new())]).unwrap();
+    assert!(backend.read_tag("entities", 0, 0).unwrap().is_none());
+    let poi = save.read_record("poi", 0, 0).expect("POI saved");
     let Some(Tag::List(records)) = poi
         .tag
         .get("Sections")
@@ -317,13 +322,160 @@ fn save_dir_routes_chunks_entities_and_poi_through_the_backend() {
     else {
         panic!("POI records are missing");
     };
-    assert_eq!(number(records[0].get("free_tickets")), Some(7));
+    assert_eq!(records.len(), 2);
+    let tickets = |x| {
+        let record = records
+            .iter()
+            .find(|record| record.get("pos") == Some(&Tag::IntArray(vec![x, 70, 2])))
+            .unwrap();
+        number(record.get("free_tickets"))
+    };
+    assert_eq!(tickets(1), Some(7));
+    assert_eq!(tickets(2), Some(32));
     assert!(!root.path().join("region").exists());
     assert!(!root.path().join("entities").exists());
     assert!(!root.path().join("poi").exists());
 }
 
-/// Negative control: reading a region file instead of `region_chunks` returns no old bits.
+#[test]
+fn queued_backend_write_overrides_the_stored_chunk() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = Arc::new(MemoryBackend::default());
+    let save = SaveDir::with_backend(
+        root.path().to_path_buf(),
+        LevelShape::OVERWORLD,
+        backend.clone(),
+    );
+    backend
+        .chunks
+        .lock()
+        .unwrap()
+        .insert((0, 0), Chunk::empty(0, 0));
+    let (signal_started, started) = mpsc::channel();
+    let (release, wait_for_release) = mpsc::channel();
+    *backend.write_gate.lock().unwrap() = Some((signal_started, wait_for_release));
+    let mut chunk = Chunk::empty(0, 0);
+    chunk.set(1, 70, 2, 1);
+    chunk.lit = true;
+    save.save_later(&[Arc::new(chunk)], registry(), biomes())
+        .unwrap();
+    started
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let queued = save.load(0, 0, registry(), biomes());
+    let far = save.load_far(0, 0, registry(), biomes());
+    release.send(()).unwrap();
+    save.flush().unwrap();
+    assert_eq!(queued.unwrap().get(1, 70, 2), 1);
+    assert_eq!(far.unwrap().get(1, 70, 2), 1);
+}
+
+#[test]
+fn backend_chunk_tags_decode_without_a_metadata_read() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = Arc::new(MemoryBackend::default());
+    let save = SaveDir::with_backend(
+        root.path().to_path_buf(),
+        LevelShape::OVERWORLD,
+        backend.clone(),
+    );
+    let mut chunk = Chunk::empty(0, 0);
+    chunk.set(1, 70, 2, 1);
+    chunk.lit = true;
+    backend
+        .chunk_tags
+        .lock()
+        .unwrap()
+        .insert((0, 0), encode(&chunk, registry(), biomes()));
+    assert_eq!(
+        save.load(0, 0, registry(), biomes()).unwrap().get(1, 70, 2),
+        1
+    );
+    assert_eq!(
+        save.load_far(0, 0, registry(), biomes())
+            .unwrap()
+            .get(1, 70, 2),
+        1
+    );
+}
+
+#[test]
+fn native_backend_chunks_feed_far_loads_and_lod() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = Arc::new(MemoryBackend::default());
+    let save = SaveDir::with_backend(
+        root.path().to_path_buf(),
+        LevelShape::OVERWORLD,
+        backend.clone(),
+    );
+    let mut chunk = Chunk::empty(0, 0);
+    chunk.set(1, 70, 2, 1);
+    chunk.lit = true;
+    chunk.light_loaded = true;
+    backend.seed_tag(
+        "region",
+        (0, 0),
+        encode_rest(&chunk, registry(), biomes(), None, save.shape),
+    );
+    backend.chunks.lock().unwrap().insert((0, 0), chunk);
+    assert_eq!(
+        save.load_far(0, 0, registry(), biomes())
+            .unwrap()
+            .get(1, 70, 2),
+        1
+    );
+    let assets = crate::assets::Assets {
+        registry: registry(),
+        properties: tables().heightmaps,
+        material_states: [BlockStateId(0); 6],
+        blocks_fluid_flow: Default::default(),
+    };
+    let lod = save.lod_surfaces(0, 0, &assets, biomes()).unwrap();
+    assert_eq!(lod[33].surface.unwrap().height, 71);
+    assert_eq!(
+        save.far_record(0, 0).unwrap().tag.get("sections"),
+        Some(&Tag::List(Vec::new()))
+    );
+}
+
+#[test]
+fn encoded_rest_uses_calculated_blending_when_the_range_matches() {
+    let mut chunk = Chunk::empty(0, 0);
+    let mut extras = ChunkExtras::default();
+    extras.root.insert(
+        "blending_data".into(),
+        Tag::compound([("min_section", Tag::Int(-4)), ("max_section", Tag::Int(20))]),
+    );
+    chunk.saved = Some(Arc::new(extras));
+    let blending = BlendingData::unpack(-4, 20, Some(&[70.0; 16])).unwrap();
+    let rest = encode_rest_saved(
+        &chunk,
+        registry(),
+        biomes(),
+        None,
+        LevelShape::OVERWORLD,
+        Some(&blending),
+    );
+    assert_eq!(
+        rest.tag.get("blending_data").unwrap().get("heights"),
+        Some(&Tag::List(vec![Tag::Float(70.0f32.to_bits()); 16]))
+    );
+}
+
+#[test]
+fn gateway_migration_leaves_backend_worlds_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let legacy = root.path().join("horizon-end-gateways.json");
+    fs::write(&legacy, b"not valid json").unwrap();
+    let save = SaveDir::with_backend(
+        root.path().to_path_buf(),
+        LevelShape::OVERWORLD,
+        Arc::new(MemoryBackend::default()),
+    );
+    assert_eq!(save.migrate_end_gateway_exits().unwrap(), 0);
+    assert_eq!(fs::read(legacy).unwrap(), b"not valid json");
+}
+
 #[test]
 fn old_chunk_bits_enumerates_backend_region_chunks() {
     let root = tempfile::tempdir().unwrap();
