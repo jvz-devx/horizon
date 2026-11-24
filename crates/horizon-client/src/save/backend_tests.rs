@@ -501,3 +501,45 @@ fn old_chunk_bits_enumerates_backend_region_chunks() {
     assert_eq!(bits[0] & 2, 2);
     assert_eq!(backend.region_chunk_queries.load(Ordering::Relaxed), 1);
 }
+
+/// A folder whose store could not be opened fails its loads and writes instead of falling
+/// back to region files, where its chunks would read as absent and be generated again.
+#[test]
+fn a_store_that_could_not_be_opened_fails_instead_of_falling_back() {
+    let root = tempfile::tempdir().unwrap();
+    let mut chunk = Chunk::empty(0, 0);
+    chunk.set(1, 70, 2, 1);
+    let anvil = SaveDir::new(root.path().to_path_buf(), LevelShape::OVERWORLD);
+    let record = Record::Tag(Arc::new(encode(&chunk, registry(), biomes())));
+    super::write_region_records(
+        &anvil.root,
+        &anvil.regions,
+        "region",
+        None,
+        &[((0, 0), &record)],
+    )
+    .unwrap();
+    let backend = chosen_backend(root.path(), Err("damaged index".into()));
+    let save =
+        SaveDir::with_optional_backend(root.path().to_path_buf(), LevelShape::OVERWORLD, backend);
+    assert!(save.try_load(0, 0, registry(), biomes()).is_err());
+    assert!(save.read_record_raw("region", 0, 0).is_none());
+    assert!(
+        super::write_region_records(
+            &save.root,
+            &save.regions,
+            "region",
+            save.backend.as_deref(),
+            &[((0, 0), &Record::Delete)],
+        )
+        .is_err()
+    );
+    // The region file is still there and untouched.
+    assert_eq!(
+        anvil
+            .load(0, 0, registry(), biomes())
+            .unwrap()
+            .get(1, 70, 2),
+        1
+    );
+}

@@ -2542,8 +2542,11 @@ pub trait Backend: Send + Sync {
         z: i32,
         context: &BackendContext<'_>,
     ) -> Result<Option<BackendChunk>>;
-    /// A record as NBT. For a native chunk this is its rest data, with an empty `sections`
-    /// list and without heightmaps or saved ticks. Other records are full region-file NBT.
+    /// A record as NBT. For a native chunk this is its rest data ([`encode_rest`]), with an
+    /// empty `sections` list and without heightmaps or saved ticks, as saved: readers of
+    /// single fields need its `DataVersion`, `Status`, `blending_data` and
+    /// `structures.starts` (old-chunk detection, structure lookups). Other records are full
+    /// region-file NBT.
     fn read_tag(&self, folder: &str, x: i32, z: i32) -> Result<Option<NamedTag>>;
     /// Write records and make them durable before returning.
     fn write(&self, folder: &str, records: &[((i32, i32), BackendRecord<'_>)]) -> Result<()>;
@@ -2551,8 +2554,48 @@ pub trait Backend: Send + Sync {
     fn region_chunks(&self, rx: i32, rz: i32) -> Result<Vec<(i32, i32)>>;
 }
 
-pub type BackendFactory = Box<dyn Fn(&Path, LevelShape) -> Option<Arc<dyn Backend>> + Send + Sync>;
+/// Chooses a dimension folder's [`Backend`]: `Ok(None)` keeps its region files. An error
+/// means the folder is on a store that could not be opened.
+pub type BackendFactory =
+    Box<dyn Fn(&Path, LevelShape) -> Result<Option<Arc<dyn Backend>>> + Send + Sync>;
 static BACKEND_FACTORY: OnceLock<BackendFactory> = OnceLock::new();
+
+/// The backend a factory's answer gives `root`. A store that could not be opened becomes
+/// one that fails every call, so loads report the error instead of the folder falling back
+/// to region files, where its chunks would be missing and generated again.
+fn chosen_backend(
+    root: &Path,
+    chosen: Result<Option<Arc<dyn Backend>>>,
+) -> Option<Arc<dyn Backend>> {
+    match chosen {
+        Ok(backend) => backend,
+        Err(e) => {
+            let reason = format!(
+                "the chunk store of {} could not be opened: {e}",
+                root.display()
+            );
+            log::error!("Horizon: {reason}");
+            Some(Arc::new(Unavailable(reason)))
+        }
+    }
+}
+
+/// The backend of a folder whose store could not be opened: every call fails with why.
+struct Unavailable(String);
+impl Backend for Unavailable {
+    fn load_chunk(&self, _: i32, _: i32, _: &BackendContext<'_>) -> Result<Option<BackendChunk>> {
+        Err(self.0.clone().into())
+    }
+    fn read_tag(&self, _: &str, _: i32, _: i32) -> Result<Option<NamedTag>> {
+        Err(self.0.clone().into())
+    }
+    fn write(&self, _: &str, _: &[((i32, i32), BackendRecord<'_>)]) -> Result<()> {
+        Err(self.0.clone().into())
+    }
+    fn region_chunks(&self, _: i32, _: i32) -> Result<Vec<(i32, i32)>> {
+        Err(self.0.clone().into())
+    }
+}
 
 /// Register the factory used by [`SaveDir::new`]. It can be set once before a world opens.
 pub fn set_backend_factory(factory: BackendFactory) -> bool {
@@ -2886,7 +2929,7 @@ impl SaveDir {
     pub fn new(root: PathBuf, shape: LevelShape) -> Self {
         let backend = BACKEND_FACTORY
             .get()
-            .and_then(|factory| factory(&root, shape));
+            .and_then(|factory| chosen_backend(&root, factory(&root, shape)));
         Self::with_optional_backend(root, shape, backend)
     }
 
