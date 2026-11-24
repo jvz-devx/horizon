@@ -502,8 +502,8 @@ fn old_chunk_bits_enumerates_backend_region_chunks() {
     assert_eq!(backend.region_chunk_queries.load(Ordering::Relaxed), 1);
 }
 
-/// A folder whose store could not be opened fails its loads and writes instead of falling
-/// back to region files, where its chunks would read as absent and be generated again.
+/// A folder whose store could not be opened fails its reads and writes instead of falling
+/// back to region files, so nothing is written over the store.
 #[test]
 fn a_store_that_could_not_be_opened_fails_instead_of_falling_back() {
     let root = tempfile::tempdir().unwrap();

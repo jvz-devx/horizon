@@ -2556,13 +2556,19 @@ pub trait Backend: Send + Sync {
 
 /// Chooses a dimension folder's [`Backend`]: `Ok(None)` keeps its region files. An error
 /// means the folder is on a store that could not be opened.
+///
+/// [`SaveDir::new`] can run more than once for the same folder while another `SaveDir` of
+/// it is alive (the saved portal ticket probe, then the level itself), so a factory that
+/// locks its store must hand out the store it already opened rather than open it again.
 pub type BackendFactory =
     Box<dyn Fn(&Path, LevelShape) -> Result<Option<Arc<dyn Backend>>> + Send + Sync>;
 static BACKEND_FACTORY: OnceLock<BackendFactory> = OnceLock::new();
 
 /// The backend a factory's answer gives `root`. A store that could not be opened becomes
-/// one that fails every call, so loads report the error instead of the folder falling back
-/// to region files, where its chunks would be missing and generated again.
+/// one that fails every call rather than the folder falling back to region files, so
+/// nothing is written over it. Its chunks then read as absent ([`SaveDir::load`]), so a
+/// level opened on it generates terrain it cannot save: the code that opens a world on a
+/// store has to check that the store opens before it opens the level.
 fn chosen_backend(
     root: &Path,
     chosen: Result<Option<Arc<dyn Backend>>>,
